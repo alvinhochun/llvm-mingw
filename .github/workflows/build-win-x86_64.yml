@@ -22,7 +22,6 @@ jobs:
 
     env:
       TAG: 14.0.0_custom
-      SYNC: 1
 
     # Steps represent a sequence of tasks that will be executed as part of the job
     steps:

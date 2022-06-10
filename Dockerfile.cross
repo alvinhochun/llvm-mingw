@@ -42,7 +42,7 @@ ARG FULL_LLVM
 COPY build-llvm.sh .
 COPY llvm-patches/ llvm-patches/
 RUN if [ -n "$WITH_PYTHON" ]; then ARG="--with-python"; fi && \
-    ./build-llvm.sh $CROSS_TOOLCHAIN_PREFIX --host=$HOST $ARG
+    SYNC=1 ./build-llvm.sh $CROSS_TOOLCHAIN_PREFIX --host=$HOST $ARG
 
 COPY build-lldb-mi.sh .
 RUN ./build-lldb-mi.sh $CROSS_TOOLCHAIN_PREFIX --host=$HOST
