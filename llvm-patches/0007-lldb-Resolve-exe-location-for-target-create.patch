@@ -1,7 +1,7 @@
-From fbbafd350f99ff18be6946a400cc406cdbf0e278 Mon Sep 17 00:00:00 2001
+From 50de5d5a442dd1de24ac2e7ce6ba168c068a4305 Mon Sep 17 00:00:00 2001
 From: Alvin Wong <alvin@alvinhc.com>
 Date: Fri, 10 Jun 2022 03:05:05 +0800
-Subject: [PATCH 6/6] [lldb] Resolve exe location for `target create`
+Subject: [PATCH 7/8] [lldb] Resolve exe location for `target create`
 
 This fixes an issue that, when you start lldb or use `target create`
 with a program name which is on $PATH, or not specify the .exe suffix of
