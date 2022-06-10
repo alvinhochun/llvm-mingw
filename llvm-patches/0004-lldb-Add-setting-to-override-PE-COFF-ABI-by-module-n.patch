@@ -1,0 +1,252 @@
+From 98c7379eebd746ebba71d79b0b4b76bd8a280f0a Mon Sep 17 00:00:00 2001
+From: Alvin Wong <alvin@alvinhc.com>
+Date: Tue, 7 Jun 2022 19:10:49 +0800
+Subject: [PATCH 4/6] [lldb] Add setting to override PE/COFF ABI by module name
+
+The setting `plugin.object-file.pe-coff.module-abi` is a string-to-enum
+map that allows specifying an ABI to a module name. For example:
+
+    ucrtbase.dll=msvc
+    libstdc++-6.dll=gnu
+
+This allows for debugging a process which mixes both modules built using
+the MSVC ABI and modules built using the MinGW ABI.
+
+Depends on D127048
+
+Differential Revision: https://reviews.llvm.org/D127234
+---
+ .../lldb/Interpreter/OptionValueDictionary.h  |  6 ++-
+ .../Interpreter/OptionValueDictionary.cpp     | 25 +++++++----
+ lldb/source/Interpreter/Property.cpp          |  7 ++--
+ .../ObjectFile/PECOFF/ObjectFilePECOFF.cpp    | 42 ++++++++++++++++++-
+ .../PECOFF/ObjectFilePECOFFProperties.td      |  5 +++
+ .../Shell/ObjectFile/PECOFF/settings-abi.yaml | 25 +++++++++++
+ 6 files changed, 98 insertions(+), 12 deletions(-)
+
+diff --git a/lldb/include/lldb/Interpreter/OptionValueDictionary.h b/lldb/include/lldb/Interpreter/OptionValueDictionary.h
+index f96cbc9fe9e7..4c6bcaecd4c7 100644
+--- a/lldb/include/lldb/Interpreter/OptionValueDictionary.h
++++ b/lldb/include/lldb/Interpreter/OptionValueDictionary.h
+@@ -12,6 +12,7 @@
+ #include <map>
+ 
+ #include "lldb/Interpreter/OptionValue.h"
++#include "lldb/lldb-private-types.h"
+ 
+ namespace lldb_private {
+ 
+@@ -19,8 +20,10 @@ class OptionValueDictionary
+     : public Cloneable<OptionValueDictionary, OptionValue> {
+ public:
+   OptionValueDictionary(uint32_t type_mask = UINT32_MAX,
++                        OptionEnumValues enum_values = OptionEnumValues(),
+                         bool raw_value_dump = true)
+-      : m_type_mask(type_mask), m_raw_value_dump(raw_value_dump) {}
++      : m_type_mask(type_mask), m_enum_values(enum_values),
++        m_raw_value_dump(raw_value_dump) {}
+ 
+   ~OptionValueDictionary() override = default;
+ 
+@@ -75,6 +78,7 @@ public:
+ protected:
+   typedef std::map<ConstString, lldb::OptionValueSP> collection;
+   uint32_t m_type_mask;
++  OptionEnumValues m_enum_values;
+   collection m_values;
+   bool m_raw_value_dump;
+ };
+diff --git a/lldb/source/Interpreter/OptionValueDictionary.cpp b/lldb/source/Interpreter/OptionValueDictionary.cpp
+index 26fed4a987e1..6baafc9213e1 100644
+--- a/lldb/source/Interpreter/OptionValueDictionary.cpp
++++ b/lldb/source/Interpreter/OptionValueDictionary.cpp
+@@ -8,11 +8,12 @@
+ 
+ #include "lldb/Interpreter/OptionValueDictionary.h"
+ 
+-#include "llvm/ADT/StringRef.h"
+ #include "lldb/DataFormatters/FormatManager.h"
++#include "lldb/Interpreter/OptionValueEnumeration.h"
+ #include "lldb/Interpreter/OptionValueString.h"
+ #include "lldb/Utility/Args.h"
+ #include "lldb/Utility/State.h"
++#include "llvm/ADT/StringRef.h"
+ 
+ using namespace lldb;
+ using namespace lldb_private;
+@@ -161,16 +162,26 @@ Status OptionValueDictionary::SetArgs(const Args &args,
+         return error;
+       }
+ 
+-      lldb::OptionValueSP value_sp(CreateValueFromCStringForTypeMask(
+-          value.str().c_str(), m_type_mask, error));
+-      if (value_sp) {
++      if (m_type_mask == 1u << eTypeEnum) {
++        auto enum_value =
++            std::make_shared<OptionValueEnumeration>(m_enum_values, 0);
++        error = enum_value->SetValueFromString(value);
+         if (error.Fail())
+           return error;
+         m_value_was_set = true;
+-        SetValueForKey(ConstString(key), value_sp, true);
++        SetValueForKey(ConstString(key), enum_value, true);
+       } else {
+-        error.SetErrorString("dictionaries that can contain multiple types "
+-                             "must subclass OptionValueArray");
++        lldb::OptionValueSP value_sp(CreateValueFromCStringForTypeMask(
++            value.str().c_str(), m_type_mask, error));
++        if (value_sp) {
++          if (error.Fail())
++            return error;
++          m_value_was_set = true;
++          SetValueForKey(ConstString(key), value_sp, true);
++        } else {
++          error.SetErrorString("dictionaries that can contain multiple types "
++                               "must subclass OptionValueArray");
++        }
+       }
+     }
+     break;
+diff --git a/lldb/source/Interpreter/Property.cpp b/lldb/source/Interpreter/Property.cpp
+index fe3a8a31394b..681596224d31 100644
+--- a/lldb/source/Interpreter/Property.cpp
++++ b/lldb/source/Interpreter/Property.cpp
+@@ -68,9 +68,10 @@ Property::Property(const PropertyDefinition &definition)
+   }
+   case OptionValue::eTypeDictionary:
+     // "definition.default_uint_value" is always a OptionValue::Type
+-    m_value_sp =
+-        std::make_shared<OptionValueDictionary>(OptionValue::ConvertTypeToMask(
+-            (OptionValue::Type)definition.default_uint_value));
++    m_value_sp = std::make_shared<OptionValueDictionary>(
++        OptionValue::ConvertTypeToMask(
++            (OptionValue::Type)definition.default_uint_value),
++        definition.enum_values);
+     break;
+ 
+   case OptionValue::eTypeEnum:
+diff --git a/lldb/source/Plugins/ObjectFile/PECOFF/ObjectFilePECOFF.cpp b/lldb/source/Plugins/ObjectFile/PECOFF/ObjectFilePECOFF.cpp
+index 9a4cf1db4588..39dfb68008a7 100644
+--- a/lldb/source/Plugins/ObjectFile/PECOFF/ObjectFilePECOFF.cpp
++++ b/lldb/source/Plugins/ObjectFile/PECOFF/ObjectFilePECOFF.cpp
+@@ -16,6 +16,7 @@
+ #include "lldb/Core/PluginManager.h"
+ #include "lldb/Core/Section.h"
+ #include "lldb/Core/StreamFile.h"
++#include "lldb/Interpreter/OptionValueDictionary.h"
+ #include "lldb/Interpreter/OptionValueProperties.h"
+ #include "lldb/Symbol/ObjectFile.h"
+ #include "lldb/Target/Process.h"
+@@ -90,6 +91,11 @@ public:
+         m_collection_sp->GetPropertyAtIndexAsEnumeration(
+             nullptr, ePropertyABI, llvm::Triple::UnknownEnvironment);
+   }
++
++  OptionValueDictionary *ModuleABIMap() const {
++    return m_collection_sp->GetPropertyAtIndexAsOptionValueDictionary(
++        nullptr, ePropertyModuleABIMap);
++  }
+ };
+ 
+ static PluginProperties &GetGlobalPluginProperties() {
+@@ -284,7 +290,41 @@ size_t ObjectFilePECOFF::GetModuleSpecifications(
+     return llvm::Triple::MSVC;
+   }();
+ 
+-  llvm::Triple::EnvironmentType env = GetGlobalPluginProperties().ABI();
++  // Check for a module-specific override.
++  OptionValueSP module_env_option;
++  const auto *map = GetGlobalPluginProperties().ModuleABIMap();
++  if (map->GetNumValues() > 0) {
++    // Step 1: Try with the exact file name.
++    auto name = file.GetLastPathComponent();
++    module_env_option = map->GetValueForKey(name);
++    if (!module_env_option) {
++      // Step 2: Try with the file name in lowercase.
++      auto name_lower = name.GetStringRef().lower();
++      module_env_option =
++          map->GetValueForKey(ConstString(llvm::StringRef(name_lower)));
++    }
++    if (!module_env_option) {
++      // Step 3: Try with the file name with ".debug" suffix stripped.
++      auto name_stripped = name.GetStringRef();
++      if (name_stripped.consume_back_insensitive(".debug")) {
++        module_env_option = map->GetValueForKey(ConstString(name_stripped));
++        if (!module_env_option) {
++          // Step 4: Try with the file name in lowercase with ".debug" suffix
++          // stripped.
++          auto name_lower = name_stripped.lower();
++          module_env_option =
++              map->GetValueForKey(ConstString(llvm::StringRef(name_lower)));
++        }
++      }
++    }
++  }
++  llvm::Triple::EnvironmentType env;
++  if (module_env_option)
++    env =
++        (llvm::Triple::EnvironmentType)module_env_option->GetEnumerationValue();
++  else
++    env = GetGlobalPluginProperties().ABI();
++
+   if (env == llvm::Triple::UnknownEnvironment)
+     env = default_env;
+ 
+diff --git a/lldb/source/Plugins/ObjectFile/PECOFF/ObjectFilePECOFFProperties.td b/lldb/source/Plugins/ObjectFile/PECOFF/ObjectFilePECOFFProperties.td
+index b2a262fd708b..cff191ead300 100644
+--- a/lldb/source/Plugins/ObjectFile/PECOFF/ObjectFilePECOFFProperties.td
++++ b/lldb/source/Plugins/ObjectFile/PECOFF/ObjectFilePECOFFProperties.td
+@@ -6,4 +6,9 @@ let Definition = "objectfilepecoff" in {
+     DefaultEnumValue<"llvm::Triple::UnknownEnvironment">,
+     EnumValues<"OptionEnumValues(g_abi_enums)">,
+     Desc<"ABI to use when loading a PE/COFF module. This configures the C++ ABI used, which affects things like the handling of class layout. Accepted values are: `msvc` for the MSVC ABI, `gnu` for the MinGW / Itanium ABI, and `default` to follow the default target if it is a Windows triple or use the MSVC ABI by default.">;
++  def ModuleABIMap: Property<"module-abi", "Dictionary">,
++    Global,
++    ElementType<"Enum">,
++    EnumValues<"OptionEnumValues(g_abi_enums)">,
++    Desc<"A mapping of ABI override to use for specific modules. The module name is matched by its file name with extension. These versions are checked in sequence: exact, lowercase, exact with '.debug' suffix stripped, lowercase with '.debug' suffix stripped.">;
+ }
+diff --git a/lldb/test/Shell/ObjectFile/PECOFF/settings-abi.yaml b/lldb/test/Shell/ObjectFile/PECOFF/settings-abi.yaml
+index d7eb3729be70..a0d7ee3b11ad 100644
+--- a/lldb/test/Shell/ObjectFile/PECOFF/settings-abi.yaml
++++ b/lldb/test/Shell/ObjectFile/PECOFF/settings-abi.yaml
+@@ -1,4 +1,5 @@
+ # RUN: yaml2obj %s -o %t
++# RUN: yaml2obj %s -o %t.debug
+ 
+ ## Default ABI is msvc:
+ # RUN: %lldb -O "settings set plugin.object-file.pe-coff.abi msvc" \
+@@ -10,6 +11,30 @@
+ # RUN:   -f %t -o "image list --triple --basename" -o exit | \
+ # RUN:   FileCheck -DABI=gnu -DFILENAME=%basename_t.tmp %s
+ 
++## Default ABI is msvc, module override is gnu:
++# RUN: %lldb -O "settings set plugin.object-file.pe-coff.abi msvc" \
++# RUN:   -O "settings append plugin.object-file.pe-coff.module-abi %basename_t.tmp=gnu" \
++# RUN:   -f %t -o "image list --triple --basename" -o exit | \
++# RUN:   FileCheck -DABI=gnu -DFILENAME=%basename_t.tmp %s
++
++## Default ABI is gnu, module override is msvc:
++# RUN: %lldb -O "settings set plugin.object-file.pe-coff.abi gnu" \
++# RUN:   -O "settings append plugin.object-file.pe-coff.module-abi %basename_t.tmp=msvc" \
++# RUN:   -f %t -o "image list --triple --basename" -o exit | \
++# RUN:   FileCheck -DABI=msvc -DFILENAME=%basename_t.tmp %s
++
++## Default ABI is msvc, module override is gnu (with .debug suffix):
++# RUN: %lldb -O "settings set plugin.object-file.pe-coff.abi msvc" \
++# RUN:   -O "settings append plugin.object-file.pe-coff.module-abi %basename_t.tmp=gnu" \
++# RUN:   -f %t.debug -o "image list --triple --basename" -o exit | \
++# RUN:   FileCheck -DABI=gnu -DFILENAME=%basename_t.tmp.debug %s
++
++## Default ABI is gnu, module override is msvc (with .debug suffix):
++# RUN: %lldb -O "settings set plugin.object-file.pe-coff.abi gnu" \
++# RUN:   -O "settings append plugin.object-file.pe-coff.module-abi %basename_t.tmp=msvc" \
++# RUN:   -f %t.debug -o "image list --triple --basename" -o exit | \
++# RUN:   FileCheck -DABI=msvc -DFILENAME=%basename_t.tmp.debug %s
++
+ # CHECK-LABEL: image list --triple --basename
+ # CHECK-NEXT: x86_64-pc-windows-[[ABI]] [[FILENAME]]
+ 
+-- 
+2.36.1
+

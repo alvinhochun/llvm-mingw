@@ -120,6 +120,9 @@ if [ -n "$SYNC" ] || [ -n "$CHECKOUT" ]; then
             ;;
         esac
     fi
+    if [ -d "../llvm-patches" ]; then
+        git am ../llvm-patches/*.patch
+    fi
     cd ..
 fi
 

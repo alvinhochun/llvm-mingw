@@ -1,0 +1,558 @@
+From b6b8d0bf9adb8c7bfc7938108152d33c22502804 Mon Sep 17 00:00:00 2001
+From: Alvin Wong <alvin@alvinhc.com>
+Date: Thu, 9 Jun 2022 22:34:02 +0300
+Subject: [PATCH 3/6] [lldb] Set COFF module ABI from default triple and make
+ it an option
+
+PE/COFF can use either MSVC or GNU (MinGW) ABI for C++ code, however
+LLDB had defaulted to MSVC implicitly with no way to override it. This
+causes issues when debugging modules built with the GNU ABI, sometimes
+even crashes.
+
+This changes the PE/COFF plugin to set the module triple according to
+the default target triple used to build LLDB. If the default target
+triple is Windows and a valid environment is specified, then this
+environment will be used for the module spec. This not only works for
+MSVC and GNU, but also other environments.
+
+A new setting, `plugin.object-file.pe-coff.abi`,  has been added to
+allow overriding this default ABI.
+
+* Fixes https://github.com/llvm/llvm-project/issues/50775
+* Fixes https://github.com/mstorsjo/llvm-mingw/issues/226
+* Fixes https://github.com/mstorsjo/llvm-mingw/issues/282
+
+Reviewed By: omjavaid
+
+Differential Revision: https://reviews.llvm.org/D127048
+
+(cherry picked from commit 25c8a061c5739677d2fc0af29a8cc9520207b923)
+---
+ lldb/include/lldb/Core/PluginManager.h        | 10 +-
+ lldb/source/Core/PluginManager.cpp            | 30 +++++-
+ .../Plugins/ObjectFile/PECOFF/CMakeLists.txt  | 12 +++
+ .../ObjectFile/PECOFF/ObjectFilePECOFF.cpp    | 91 ++++++++++++++++++-
+ .../ObjectFile/PECOFF/ObjectFilePECOFF.h      |  2 +
+ .../PECOFF/ObjectFilePECOFFProperties.td      |  9 ++
+ .../ObjectFile/PECOFF/basic-info-arm.yaml     |  2 +-
+ .../ObjectFile/PECOFF/basic-info-arm64.yaml   |  2 +-
+ .../Shell/ObjectFile/PECOFF/basic-info.yaml   |  2 +-
+ .../PECOFF/default-triple-windows-gnu.yaml    | 41 +++++++++
+ .../PECOFF/default-triple-windows-msvc.yaml   | 41 +++++++++
+ .../Shell/ObjectFile/PECOFF/settings-abi.yaml | 49 ++++++++++
+ lldb/test/Shell/lit.cfg.py                    |  6 ++
+ 13 files changed, 285 insertions(+), 12 deletions(-)
+ create mode 100644 lldb/source/Plugins/ObjectFile/PECOFF/ObjectFilePECOFFProperties.td
+ create mode 100644 lldb/test/Shell/ObjectFile/PECOFF/default-triple-windows-gnu.yaml
+ create mode 100644 lldb/test/Shell/ObjectFile/PECOFF/default-triple-windows-msvc.yaml
+ create mode 100644 lldb/test/Shell/ObjectFile/PECOFF/settings-abi.yaml
+
+diff --git a/lldb/include/lldb/Core/PluginManager.h b/lldb/include/lldb/Core/PluginManager.h
+index 1ab9d26d3af4..8322585b2253 100644
+--- a/lldb/include/lldb/Core/PluginManager.h
++++ b/lldb/include/lldb/Core/PluginManager.h
+@@ -174,7 +174,8 @@ public:
+                  ObjectFileCreateInstance create_callback,
+                  ObjectFileCreateMemoryInstance create_memory_callback,
+                  ObjectFileGetModuleSpecifications get_module_specifications,
+-                 ObjectFileSaveCore save_core = nullptr);
++                 ObjectFileSaveCore save_core = nullptr,
++                 DebuggerInitializeCallback debugger_init_callback = nullptr);
+ 
+   static bool UnregisterPlugin(ObjectFileCreateInstance create_callback);
+ 
+@@ -482,6 +483,13 @@ public:
+       Debugger &debugger, const lldb::OptionValuePropertiesSP &properties_sp,
+       ConstString description, bool is_global_property);
+ 
++  static lldb::OptionValuePropertiesSP
++  GetSettingForObjectFilePlugin(Debugger &debugger, ConstString setting_name);
++
++  static bool CreateSettingForObjectFilePlugin(
++      Debugger &debugger, const lldb::OptionValuePropertiesSP &properties_sp,
++      ConstString description, bool is_global_property);
++
+   static lldb::OptionValuePropertiesSP
+   GetSettingForSymbolFilePlugin(Debugger &debugger, ConstString setting_name);
+ 
+diff --git a/lldb/source/Core/PluginManager.cpp b/lldb/source/Core/PluginManager.cpp
+index 37050494aa2e..f12efad560b2 100644
+--- a/lldb/source/Core/PluginManager.cpp
++++ b/lldb/source/Core/PluginManager.cpp
+@@ -621,9 +621,10 @@ struct ObjectFileInstance : public PluginInstance<ObjectFileCreateInstance> {
+       CallbackType create_callback,
+       ObjectFileCreateMemoryInstance create_memory_callback,
+       ObjectFileGetModuleSpecifications get_module_specifications,
+-      ObjectFileSaveCore save_core)
+-      : PluginInstance<ObjectFileCreateInstance>(name, description,
+-                                                 create_callback),
++      ObjectFileSaveCore save_core,
++      DebuggerInitializeCallback debugger_init_callback)
++      : PluginInstance<ObjectFileCreateInstance>(
++            name, description, create_callback, debugger_init_callback),
+         create_memory_callback(create_memory_callback),
+         get_module_specifications(get_module_specifications),
+         save_core(save_core) {}
+@@ -644,10 +645,11 @@ bool PluginManager::RegisterPlugin(
+     ObjectFileCreateInstance create_callback,
+     ObjectFileCreateMemoryInstance create_memory_callback,
+     ObjectFileGetModuleSpecifications get_module_specifications,
+-    ObjectFileSaveCore save_core) {
++    ObjectFileSaveCore save_core,
++    DebuggerInitializeCallback debugger_init_callback) {
+   return GetObjectFileInstances().RegisterPlugin(
+       name, description, create_callback, create_memory_callback,
+-      get_module_specifications, save_core);
++      get_module_specifications, save_core, debugger_init_callback);
+ }
+ 
+ bool PluginManager::UnregisterPlugin(ObjectFileCreateInstance create_callback) {
+@@ -1364,6 +1366,7 @@ LanguageSet PluginManager::GetREPLAllTypeSystemSupportedLanguages() {
+ void PluginManager::DebuggerInitialize(Debugger &debugger) {
+   GetDynamicLoaderInstances().PerformDebuggerCallback(debugger);
+   GetJITLoaderInstances().PerformDebuggerCallback(debugger);
++  GetObjectFileInstances().PerformDebuggerCallback(debugger);
+   GetPlatformInstances().PerformDebuggerCallback(debugger);
+   GetProcessInstances().PerformDebuggerCallback(debugger);
+   GetSymbolFileInstances().PerformDebuggerCallback(debugger);
+@@ -1490,6 +1493,7 @@ CreateSettingForPlugin(Debugger &debugger, ConstString plugin_type_name,
+ static const char *kDynamicLoaderPluginName("dynamic-loader");
+ static const char *kPlatformPluginName("platform");
+ static const char *kProcessPluginName("process");
++static const char *kObjectFilePluginName("object-file");
+ static const char *kSymbolFilePluginName("symbol-file");
+ static const char *kJITLoaderPluginName("jit-loader");
+ static const char *kStructuredDataPluginName("structured-data");
+@@ -1542,6 +1546,22 @@ bool PluginManager::CreateSettingForProcessPlugin(
+                                 properties_sp, description, is_global_property);
+ }
+ 
++lldb::OptionValuePropertiesSP
++PluginManager::GetSettingForObjectFilePlugin(Debugger &debugger,
++                                             ConstString setting_name) {
++  return GetSettingForPlugin(debugger, setting_name,
++                             ConstString(kObjectFilePluginName));
++}
++
++bool PluginManager::CreateSettingForObjectFilePlugin(
++    Debugger &debugger, const lldb::OptionValuePropertiesSP &properties_sp,
++    ConstString description, bool is_global_property) {
++  return CreateSettingForPlugin(
++      debugger, ConstString(kObjectFilePluginName),
++      ConstString("Settings for object file plug-ins"), properties_sp,
++      description, is_global_property);
++}
++
+ lldb::OptionValuePropertiesSP
+ PluginManager::GetSettingForSymbolFilePlugin(Debugger &debugger,
+                                              ConstString setting_name) {
+diff --git a/lldb/source/Plugins/ObjectFile/PECOFF/CMakeLists.txt b/lldb/source/Plugins/ObjectFile/PECOFF/CMakeLists.txt
+index ad768feca30a..2553267c3bf2 100644
+--- a/lldb/source/Plugins/ObjectFile/PECOFF/CMakeLists.txt
++++ b/lldb/source/Plugins/ObjectFile/PECOFF/CMakeLists.txt
+@@ -5,6 +5,14 @@ else()
+   set(DBGHELP_LINK_FILES "")
+ endif()
+ 
++lldb_tablegen(ObjectFilePECOFFProperties.inc -gen-lldb-property-defs
++  SOURCE ObjectFilePECOFFProperties.td
++  TARGET LLDBPluginObjectFilePECOFFPropertiesGen)
++
++lldb_tablegen(ObjectFilePECOFFPropertiesEnum.inc -gen-lldb-property-enum-defs
++  SOURCE ObjectFilePECOFFProperties.td
++  TARGET LLDBPluginObjectFilePECOFFPropertiesEnumGen)
++
+ add_lldb_library(lldbPluginObjectFilePECOFF PLUGIN
+   ObjectFilePECOFF.cpp
+   PECallFrameInfo.cpp
+@@ -20,3 +28,7 @@ add_lldb_library(lldbPluginObjectFilePECOFF PLUGIN
+     BinaryFormat
+     Support
+   )
++
++add_dependencies(lldbPluginObjectFilePECOFF
++  LLDBPluginObjectFilePECOFFPropertiesGen
++  LLDBPluginObjectFilePECOFFPropertiesEnumGen)
+diff --git a/lldb/source/Plugins/ObjectFile/PECOFF/ObjectFilePECOFF.cpp b/lldb/source/Plugins/ObjectFile/PECOFF/ObjectFilePECOFF.cpp
+index dea474b8ac25..9a4cf1db4588 100644
+--- a/lldb/source/Plugins/ObjectFile/PECOFF/ObjectFilePECOFF.cpp
++++ b/lldb/source/Plugins/ObjectFile/PECOFF/ObjectFilePECOFF.cpp
+@@ -16,6 +16,7 @@
+ #include "lldb/Core/PluginManager.h"
+ #include "lldb/Core/Section.h"
+ #include "lldb/Core/StreamFile.h"
++#include "lldb/Interpreter/OptionValueProperties.h"
+ #include "lldb/Symbol/ObjectFile.h"
+ #include "lldb/Target/Process.h"
+ #include "lldb/Target/SectionLoadList.h"
+@@ -32,6 +33,7 @@
+ #include "llvm/Object/COFFImportFile.h"
+ #include "llvm/Support/CRC.h"
+ #include "llvm/Support/Error.h"
++#include "llvm/Support/Host.h"
+ #include "llvm/Support/MemoryBuffer.h"
+ 
+ #define IMAGE_DOS_SIGNATURE 0x5A4D    // MZ
+@@ -44,6 +46,59 @@ using namespace lldb_private;
+ 
+ LLDB_PLUGIN_DEFINE(ObjectFilePECOFF)
+ 
++namespace {
++
++static constexpr OptionEnumValueElement g_abi_enums[] = {
++    {
++        llvm::Triple::UnknownEnvironment,
++        "default",
++        "Use default target (if it is Windows) or MSVC",
++    },
++    {
++        llvm::Triple::MSVC,
++        "msvc",
++        "MSVC ABI",
++    },
++    {
++        llvm::Triple::GNU,
++        "gnu",
++        "MinGW / Itanium ABI",
++    },
++};
++
++#define LLDB_PROPERTIES_objectfilepecoff
++#include "ObjectFilePECOFFProperties.inc"
++
++enum {
++#define LLDB_PROPERTIES_objectfilepecoff
++#include "ObjectFilePECOFFPropertiesEnum.inc"
++};
++
++class PluginProperties : public Properties {
++public:
++  static ConstString GetSettingName() {
++    return ConstString(ObjectFilePECOFF::GetPluginNameStatic());
++  }
++
++  PluginProperties() {
++    m_collection_sp = std::make_shared<OptionValueProperties>(GetSettingName());
++    m_collection_sp->Initialize(g_objectfilepecoff_properties);
++  }
++
++  llvm::Triple::EnvironmentType ABI() const {
++    return (llvm::Triple::EnvironmentType)
++        m_collection_sp->GetPropertyAtIndexAsEnumeration(
++            nullptr, ePropertyABI, llvm::Triple::UnknownEnvironment);
++  }
++};
++
++static PluginProperties &GetGlobalPluginProperties() {
++  static PluginProperties g_settings;
++  return g_settings;
++}
++
++} // namespace
++
+ static bool GetDebugLinkContents(const llvm::object::COFFObjectFile &coff_obj,
+                                  std::string &gnu_debuglink_file,
+                                  uint32_t &gnu_debuglink_crc) {
+@@ -114,9 +169,21 @@ static UUID GetCoffUUID(llvm::object::COFFObjectFile &coff_obj) {
+ char ObjectFilePECOFF::ID;
+ 
+ void ObjectFilePECOFF::Initialize() {
+-  PluginManager::RegisterPlugin(
+-      GetPluginNameStatic(), GetPluginDescriptionStatic(), CreateInstance,
+-      CreateMemoryInstance, GetModuleSpecifications, SaveCore);
++  PluginManager::RegisterPlugin(GetPluginNameStatic(),
++                                GetPluginDescriptionStatic(), CreateInstance,
++                                CreateMemoryInstance, GetModuleSpecifications,
++                                SaveCore, DebuggerInitialize);
++}
++
++void ObjectFilePECOFF::DebuggerInitialize(Debugger &debugger) {
++  if (!PluginManager::GetSettingForObjectFilePlugin(
++          debugger, PluginProperties::GetSettingName())) {
++    const bool is_global_setting = true;
++    PluginManager::CreateSettingForObjectFilePlugin(
++        debugger, GetGlobalPluginProperties().GetValueProperties(),
++        ConstString("Properties for the PE/COFF object-file plug-in."),
++        is_global_setting);
++  }
+ }
+ 
+ void ObjectFilePECOFF::Terminate() {
+@@ -208,23 +275,41 @@ size_t ObjectFilePECOFF::GetModuleSpecifications(
+   if (!uuid.IsValid())
+     uuid = GetCoffUUID(*COFFObj);
+ 
++  static llvm::Triple::EnvironmentType default_env = [] {
++    auto def_target = llvm::Triple(
++        llvm::Triple::normalize(llvm::sys::getDefaultTargetTriple()));
++    if (def_target.getOS() == llvm::Triple::Win32 &&
++        def_target.getEnvironment() != llvm::Triple::UnknownEnvironment)
++      return def_target.getEnvironment();
++    return llvm::Triple::MSVC;
++  }();
++
++  llvm::Triple::EnvironmentType env = GetGlobalPluginProperties().ABI();
++  if (env == llvm::Triple::UnknownEnvironment)
++    env = default_env;
++
+   switch (COFFObj->getMachine()) {
+   case MachineAmd64:
+     spec.SetTriple("x86_64-pc-windows");
++    spec.GetTriple().setEnvironment(env);
+     specs.Append(module_spec);
+     break;
+   case MachineX86:
+     spec.SetTriple("i386-pc-windows");
++    spec.GetTriple().setEnvironment(env);
+     specs.Append(module_spec);
+     spec.SetTriple("i686-pc-windows");
++    spec.GetTriple().setEnvironment(env);
+     specs.Append(module_spec);
+     break;
+   case MachineArmNt:
+     spec.SetTriple("armv7-pc-windows");
++    spec.GetTriple().setEnvironment(env);
+     specs.Append(module_spec);
+     break;
+   case MachineArm64:
+     spec.SetTriple("aarch64-pc-windows");
++    spec.GetTriple().setEnvironment(env);
+     specs.Append(module_spec);
+     break;
+   default:
+diff --git a/lldb/source/Plugins/ObjectFile/PECOFF/ObjectFilePECOFF.h b/lldb/source/Plugins/ObjectFile/PECOFF/ObjectFilePECOFF.h
+index a208fe6d1c65..8eedc8960ee4 100644
+--- a/lldb/source/Plugins/ObjectFile/PECOFF/ObjectFilePECOFF.h
++++ b/lldb/source/Plugins/ObjectFile/PECOFF/ObjectFilePECOFF.h
+@@ -55,6 +55,8 @@ public:
+   // Static Functions
+   static void Initialize();
+ 
++  static void DebuggerInitialize(lldb_private::Debugger &debugger);
++
+   static void Terminate();
+ 
+   static llvm::StringRef GetPluginNameStatic() { return "pe-coff"; }
+diff --git a/lldb/source/Plugins/ObjectFile/PECOFF/ObjectFilePECOFFProperties.td b/lldb/source/Plugins/ObjectFile/PECOFF/ObjectFilePECOFFProperties.td
+new file mode 100644
+index 000000000000..b2a262fd708b
+--- /dev/null
++++ b/lldb/source/Plugins/ObjectFile/PECOFF/ObjectFilePECOFFProperties.td
+@@ -0,0 +1,9 @@
++include "../../../../include/lldb/Core/PropertiesBase.td"
++
++let Definition = "objectfilepecoff" in {
++  def ABI: Property<"abi", "Enum">,
++    Global,
++    DefaultEnumValue<"llvm::Triple::UnknownEnvironment">,
++    EnumValues<"OptionEnumValues(g_abi_enums)">,
++    Desc<"ABI to use when loading a PE/COFF module. This configures the C++ ABI used, which affects things like the handling of class layout. Accepted values are: `msvc` for the MSVC ABI, `gnu` for the MinGW / Itanium ABI, and `default` to follow the default target if it is a Windows triple or use the MSVC ABI by default.">;
++}
+diff --git a/lldb/test/Shell/ObjectFile/PECOFF/basic-info-arm.yaml b/lldb/test/Shell/ObjectFile/PECOFF/basic-info-arm.yaml
+index 321e96bfacfa..259014f206f3 100644
+--- a/lldb/test/Shell/ObjectFile/PECOFF/basic-info-arm.yaml
++++ b/lldb/test/Shell/ObjectFile/PECOFF/basic-info-arm.yaml
+@@ -2,7 +2,7 @@
+ # RUN: lldb-test object-file %t | FileCheck %s
+ 
+ # CHECK: Plugin name: pe-coff
+-# CHECK: Architecture: armv7-pc-windows-msvc
++# CHECK: Architecture: armv7-pc-windows-{{(msvc|gnu)}}
+ # CHECK: UUID: 
+ # CHECK: Executable: true
+ # CHECK: Stripped: false
+diff --git a/lldb/test/Shell/ObjectFile/PECOFF/basic-info-arm64.yaml b/lldb/test/Shell/ObjectFile/PECOFF/basic-info-arm64.yaml
+index dd02a378fa2b..eb6f7d77ea21 100644
+--- a/lldb/test/Shell/ObjectFile/PECOFF/basic-info-arm64.yaml
++++ b/lldb/test/Shell/ObjectFile/PECOFF/basic-info-arm64.yaml
+@@ -2,7 +2,7 @@
+ # RUN: lldb-test object-file %t | FileCheck %s
+ 
+ # CHECK: Plugin name: pe-coff
+-# CHECK: Architecture: aarch64-pc-windows-msvc
++# CHECK: Architecture: aarch64-pc-windows-{{(msvc|gnu)}}
+ # CHECK: UUID: 
+ # CHECK: Executable: true
+ # CHECK: Stripped: false
+diff --git a/lldb/test/Shell/ObjectFile/PECOFF/basic-info.yaml b/lldb/test/Shell/ObjectFile/PECOFF/basic-info.yaml
+index 702774347eea..d3657bc1168f 100644
+--- a/lldb/test/Shell/ObjectFile/PECOFF/basic-info.yaml
++++ b/lldb/test/Shell/ObjectFile/PECOFF/basic-info.yaml
+@@ -2,7 +2,7 @@
+ # RUN: lldb-test object-file %t | FileCheck %s
+ 
+ # CHECK: Plugin name: pe-coff
+-# CHECK: Architecture: x86_64-pc-windows-msvc
++# CHECK: Architecture: x86_64-pc-windows-{{(msvc|gnu)}}
+ # CHECK: UUID: 
+ # CHECK: Executable: true
+ # CHECK: Stripped: false
+diff --git a/lldb/test/Shell/ObjectFile/PECOFF/default-triple-windows-gnu.yaml b/lldb/test/Shell/ObjectFile/PECOFF/default-triple-windows-gnu.yaml
+new file mode 100644
+index 000000000000..7d21dd4e14a0
+--- /dev/null
++++ b/lldb/test/Shell/ObjectFile/PECOFF/default-triple-windows-gnu.yaml
+@@ -0,0 +1,41 @@
++# XFAIL: !windows-gnu
++
++# RUN: yaml2obj %s -o %t
++# RUN: lldb-test object-file %t | FileCheck %s
++
++# CHECK: Architecture: x86_64-pc-windows-gnu
++
++--- !COFF
++OptionalHeader:
++  AddressOfEntryPoint: 5152
++  ImageBase:       5368709120
++  SectionAlignment: 4096
++  FileAlignment:   512
++  MajorOperatingSystemVersion: 6
++  MinorOperatingSystemVersion: 0
++  MajorImageVersion: 0
++  MinorImageVersion: 0
++  MajorSubsystemVersion: 6
++  MinorSubsystemVersion: 0
++  Subsystem:       IMAGE_SUBSYSTEM_WINDOWS_CUI
++  DLLCharacteristics: [ IMAGE_DLL_CHARACTERISTICS_HIGH_ENTROPY_VA, IMAGE_DLL_CHARACTERISTICS_DYNAMIC_BASE, IMAGE_DLL_CHARACTERISTICS_NX_COMPAT, IMAGE_DLL_CHARACTERISTICS_TERMINAL_SERVER_AWARE ]
++  SizeOfStackReserve: 1048576
++  SizeOfStackCommit: 4096
++  SizeOfHeapReserve: 1048576
++  SizeOfHeapCommit: 4096
++header:
++  Machine:         IMAGE_FILE_MACHINE_AMD64
++  Characteristics: [ IMAGE_FILE_EXECUTABLE_IMAGE, IMAGE_FILE_LARGE_ADDRESS_AWARE ]
++sections:
++  - Name:            .text
++    Characteristics: [ IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ ]
++    VirtualAddress:  4096
++    VirtualSize:     64
++    SectionData:     DEADBEEFBAADF00D
++  - Name:            .data
++    Characteristics: [ IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_MEM_READ ]
++    VirtualAddress:  8192
++    VirtualSize:     64
++    SectionData:     DEADBEEFBAADF00D
++symbols:         []
++...
+diff --git a/lldb/test/Shell/ObjectFile/PECOFF/default-triple-windows-msvc.yaml b/lldb/test/Shell/ObjectFile/PECOFF/default-triple-windows-msvc.yaml
+new file mode 100644
+index 000000000000..1f0380e1f856
+--- /dev/null
++++ b/lldb/test/Shell/ObjectFile/PECOFF/default-triple-windows-msvc.yaml
+@@ -0,0 +1,41 @@
++# XFAIL: windows-gnu
++
++# RUN: yaml2obj %s -o %t
++# RUN: lldb-test object-file %t | FileCheck %s
++
++# CHECK: Architecture: x86_64-pc-windows-msvc
++
++--- !COFF
++OptionalHeader:
++  AddressOfEntryPoint: 5152
++  ImageBase:       5368709120
++  SectionAlignment: 4096
++  FileAlignment:   512
++  MajorOperatingSystemVersion: 6
++  MinorOperatingSystemVersion: 0
++  MajorImageVersion: 0
++  MinorImageVersion: 0
++  MajorSubsystemVersion: 6
++  MinorSubsystemVersion: 0
++  Subsystem:       IMAGE_SUBSYSTEM_WINDOWS_CUI
++  DLLCharacteristics: [ IMAGE_DLL_CHARACTERISTICS_HIGH_ENTROPY_VA, IMAGE_DLL_CHARACTERISTICS_DYNAMIC_BASE, IMAGE_DLL_CHARACTERISTICS_NX_COMPAT, IMAGE_DLL_CHARACTERISTICS_TERMINAL_SERVER_AWARE ]
++  SizeOfStackReserve: 1048576
++  SizeOfStackCommit: 4096
++  SizeOfHeapReserve: 1048576
++  SizeOfHeapCommit: 4096
++header:
++  Machine:         IMAGE_FILE_MACHINE_AMD64
++  Characteristics: [ IMAGE_FILE_EXECUTABLE_IMAGE, IMAGE_FILE_LARGE_ADDRESS_AWARE ]
++sections:
++  - Name:            .text
++    Characteristics: [ IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ ]
++    VirtualAddress:  4096
++    VirtualSize:     64
++    SectionData:     DEADBEEFBAADF00D
++  - Name:            .data
++    Characteristics: [ IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_MEM_READ ]
++    VirtualAddress:  8192
++    VirtualSize:     64
++    SectionData:     DEADBEEFBAADF00D
++symbols:         []
++...
+diff --git a/lldb/test/Shell/ObjectFile/PECOFF/settings-abi.yaml b/lldb/test/Shell/ObjectFile/PECOFF/settings-abi.yaml
+new file mode 100644
+index 000000000000..d7eb3729be70
+--- /dev/null
++++ b/lldb/test/Shell/ObjectFile/PECOFF/settings-abi.yaml
+@@ -0,0 +1,49 @@
++# RUN: yaml2obj %s -o %t
++
++## Default ABI is msvc:
++# RUN: %lldb -O "settings set plugin.object-file.pe-coff.abi msvc" \
++# RUN:   -f %t -o "image list --triple --basename" -o exit | \
++# RUN:   FileCheck -DABI=msvc -DFILENAME=%basename_t.tmp %s
++
++## Default ABI is gnu:
++# RUN: %lldb -O "settings set plugin.object-file.pe-coff.abi gnu" \
++# RUN:   -f %t -o "image list --triple --basename" -o exit | \
++# RUN:   FileCheck -DABI=gnu -DFILENAME=%basename_t.tmp %s
++
++# CHECK-LABEL: image list --triple --basename
++# CHECK-NEXT: x86_64-pc-windows-[[ABI]] [[FILENAME]]
++
++--- !COFF
++OptionalHeader:
++  AddressOfEntryPoint: 5152
++  ImageBase:       5368709120
++  SectionAlignment: 4096
++  FileAlignment:   512
++  MajorOperatingSystemVersion: 6
++  MinorOperatingSystemVersion: 0
++  MajorImageVersion: 0
++  MinorImageVersion: 0
++  MajorSubsystemVersion: 6
++  MinorSubsystemVersion: 0
++  Subsystem:       IMAGE_SUBSYSTEM_WINDOWS_CUI
++  DLLCharacteristics: [ IMAGE_DLL_CHARACTERISTICS_HIGH_ENTROPY_VA, IMAGE_DLL_CHARACTERISTICS_DYNAMIC_BASE, IMAGE_DLL_CHARACTERISTICS_NX_COMPAT, IMAGE_DLL_CHARACTERISTICS_TERMINAL_SERVER_AWARE ]
++  SizeOfStackReserve: 1048576
++  SizeOfStackCommit: 4096
++  SizeOfHeapReserve: 1048576
++  SizeOfHeapCommit: 4096
++header:
++  Machine:         IMAGE_FILE_MACHINE_AMD64
++  Characteristics: [ IMAGE_FILE_EXECUTABLE_IMAGE, IMAGE_FILE_LARGE_ADDRESS_AWARE ]
++sections:
++  - Name:            .text
++    Characteristics: [ IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ ]
++    VirtualAddress:  4096
++    VirtualSize:     64
++    SectionData:     DEADBEEFBAADF00D
++  - Name:            .data
++    Characteristics: [ IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_MEM_READ ]
++    VirtualAddress:  8192
++    VirtualSize:     64
++    SectionData:     DEADBEEFBAADF00D
++symbols:         []
++...
+diff --git a/lldb/test/Shell/lit.cfg.py b/lldb/test/Shell/lit.cfg.py
+index ccff49194319..72c2717a1fc3 100644
+--- a/lldb/test/Shell/lit.cfg.py
++++ b/lldb/test/Shell/lit.cfg.py
+@@ -63,6 +63,12 @@ toolchain.use_support_substitutions(config)
+ if re.match(r'^arm(hf.*-linux)|(.*-linux-gnuabihf)', config.target_triple):
+     config.available_features.add("armhf-linux")
+ 
++if re.match(r'.*-(windows-msvc)$', config.target_triple):
++    config.available_features.add("windows-msvc")
++
++if re.match(r'.*-(windows-gnu|mingw32)$', config.target_triple):
++    config.available_features.add("windows-gnu")
++
+ def calculate_arch_features(arch_string):
+     # This will add a feature such as x86, arm, mips, etc for each built
+     # target
+-- 
+2.36.1
+

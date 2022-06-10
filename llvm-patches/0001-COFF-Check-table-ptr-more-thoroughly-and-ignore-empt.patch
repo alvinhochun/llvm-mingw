@@ -1,0 +1,438 @@
+From ca33f19bdb3f9486689abf8937e776a6177c86d8 Mon Sep 17 00:00:00 2001
+From: Alvin Wong <alvin@alvinhc.com>
+Date: Fri, 3 Jun 2022 17:57:57 +0300
+Subject: [PATCH 1/6] [COFF] Check table ptr more thoroughly and ignore empty
+ sections
+
+When loading split debug files for PE/COFF executables (produced with
+`objcopy --only-keep-debug`), the tables or directories in such files
+may point to data inside sections that may have been stripped.
+COFFObjectFile shall detect and gracefully handle this, to allow the
+object file be loaded without considering these tables or directories.
+This is required for LLDB to load these files for use as debug symbols.
+
+COFFObjectFile shall also check these pointers more carefully to account
+for cases in which the section contains less raw data than the size
+given by VirtualSize, to prevent going out of bounds.
+
+This commit also changes COFFDump in llvm-objdump to reuse the pointers
+that are already range-checked in COFFObjectFile. This fixes a crash
+when trying to dump the TLS directory from a stripped file.
+
+Fixes https://github.com/mstorsjo/llvm-mingw/issues/284
+
+Reviewed By: rnk
+
+Differential Revision: https://reviews.llvm.org/D126898
+
+(cherry picked from commit bb94611d6545c2c5271f5bb01de1aa4228a37250)
+---
+ llvm/include/llvm/Object/COFF.h               |   6 +
+ llvm/include/llvm/Object/Error.h              |   1 +
+ llvm/lib/Object/COFFObjectFile.cpp            |  57 +++++++--
+ llvm/lib/Object/Error.cpp                     |   2 +
+ .../Object/Inputs/COFF/dwarf-debug-only.yaml  | 109 ++++++++++++++++++
+ llvm/test/Object/coff-dwarf-debug-only.test   |  28 +++++
+ llvm/tools/llvm-objdump/COFFDump.cpp          |  32 ++---
+ 7 files changed, 203 insertions(+), 32 deletions(-)
+ create mode 100644 llvm/test/Object/Inputs/COFF/dwarf-debug-only.yaml
+ create mode 100644 llvm/test/Object/coff-dwarf-debug-only.test
+
+diff --git a/llvm/include/llvm/Object/COFF.h b/llvm/include/llvm/Object/COFF.h
+index 3add3811069b..3e081a4d1ad5 100644
+--- a/llvm/include/llvm/Object/COFF.h
++++ b/llvm/include/llvm/Object/COFF.h
+@@ -1296,6 +1296,12 @@ struct FpoData {
+   frame_type getFP() const { return static_cast<frame_type>(Attributes >> 14); }
+ };
+ 
++class SectionStrippedError
++    : public ErrorInfo<SectionStrippedError, BinaryError> {
++public:
++  SectionStrippedError() { setErrorCode(object_error::section_stripped); }
++};
++
+ } // end namespace object
+ 
+ } // end namespace llvm
+diff --git a/llvm/include/llvm/Object/Error.h b/llvm/include/llvm/Object/Error.h
+index af334fc42658..8875fb6e1a20 100644
+--- a/llvm/include/llvm/Object/Error.h
++++ b/llvm/include/llvm/Object/Error.h
+@@ -34,6 +34,7 @@ enum class object_error {
+   invalid_section_index,
+   bitcode_section_not_found,
+   invalid_symbol_index,
++  section_stripped,
+ };
+ 
+ inline std::error_code make_error_code(object_error e) {
+diff --git a/llvm/lib/Object/COFFObjectFile.cpp b/llvm/lib/Object/COFFObjectFile.cpp
+index 354b3c0d5577..77d306884700 100644
+--- a/llvm/lib/Object/COFFObjectFile.cpp
++++ b/llvm/lib/Object/COFFObjectFile.cpp
+@@ -475,6 +475,25 @@ Error COFFObjectFile::getRvaPtr(uint32_t Addr, uintptr_t &Res) const {
+     uint32_t SectionStart = Section->VirtualAddress;
+     uint32_t SectionEnd = Section->VirtualAddress + Section->VirtualSize;
+     if (SectionStart <= Addr && Addr < SectionEnd) {
++      // A table/directory entry can be pointing to somewhere in a stripped
++      // section, in an object that went through `objcopy --only-keep-debug`.
++      // In this case we don't want to cause the parsing of the object file to
++      // fail, otherwise it will be impossible to use this object as debug info
++      // in LLDB. Return SectionStrippedError here so that
++      // COFFObjectFile::initialize can ignore the error.
++      if (Section->SizeOfRawData == 0)
++        return make_error<SectionStrippedError>();
++      if (Section->SizeOfRawData < Section->VirtualSize &&
++          Addr >= SectionStart + Section->SizeOfRawData) {
++        if (ErrorContext)
++          return createStringError(object_error::parse_failed,
++                                   "RVA 0x%" PRIx32
++                                   " for %s found but data is incomplete",
++                                   Addr, ErrorContext);
++        return createStringError(
++            object_error::parse_failed,
++            "RVA 0x%" PRIx32 " found but data is incomplete", Addr);
++      }
+       uint32_t Offset = Addr - SectionStart;
+       Res = reinterpret_cast<uintptr_t>(base()) + Section->PointerToRawData +
+             Offset;
+@@ -588,6 +607,9 @@ Error COFFObjectFile::initDelayImportTablePtr() {
+   uintptr_t IntPtr = 0;
+   if (Error E = getRvaPtr(RVA, IntPtr))
+     return E;
++  if (Error E = checkOffset(Data, IntPtr, DataEntry->Size))
++    return E;
++
+   DelayImportDirectory = reinterpret_cast<
+       const delay_import_directory_table_entry *>(IntPtr);
+   return Error::success();
+@@ -609,6 +631,9 @@ Error COFFObjectFile::initExportTablePtr() {
+   uintptr_t IntPtr = 0;
+   if (Error E = getRvaPtr(ExportTableRva, IntPtr))
+     return E;
++  if (Error E = checkOffset(Data, IntPtr, DataEntry->Size))
++    return E;
++
+   ExportDirectory =
+       reinterpret_cast<const export_directory_table_entry *>(IntPtr);
+   return Error::success();
+@@ -625,6 +650,9 @@ Error COFFObjectFile::initBaseRelocPtr() {
+   uintptr_t IntPtr = 0;
+   if (Error E = getRvaPtr(DataEntry->RelativeVirtualAddress, IntPtr))
+     return E;
++  if (Error E = checkOffset(Data, IntPtr, DataEntry->Size))
++    return E;
++
+   BaseRelocHeader = reinterpret_cast<const coff_base_reloc_block_header *>(
+       IntPtr);
+   BaseRelocEnd = reinterpret_cast<coff_base_reloc_block_header *>(
+@@ -651,6 +679,9 @@ Error COFFObjectFile::initDebugDirectoryPtr() {
+   uintptr_t IntPtr = 0;
+   if (Error E = getRvaPtr(DataEntry->RelativeVirtualAddress, IntPtr))
+     return E;
++  if (Error E = checkOffset(Data, IntPtr, DataEntry->Size))
++    return E;
++
+   DebugDirectoryBegin = reinterpret_cast<const debug_directory *>(IntPtr);
+   DebugDirectoryEnd = reinterpret_cast<const debug_directory *>(
+       IntPtr + DataEntry->Size);
+@@ -682,6 +713,8 @@ Error COFFObjectFile::initTLSDirectoryPtr() {
+   uintptr_t IntPtr = 0;
+   if (Error E = getRvaPtr(DataEntry->RelativeVirtualAddress, IntPtr))
+     return E;
++  if (Error E = checkOffset(Data, IntPtr, DataEntry->Size))
++    return E;
+ 
+   if (is64())
+     TLSDirectory64 = reinterpret_cast<const coff_tls_directory64 *>(IntPtr);
+@@ -703,6 +736,8 @@ Error COFFObjectFile::initLoadConfigPtr() {
+   uintptr_t IntPtr = 0;
+   if (Error E = getRvaPtr(DataEntry->RelativeVirtualAddress, IntPtr))
+     return E;
++  if (Error E = checkOffset(Data, IntPtr, DataEntry->Size))
++    return E;
+ 
+   LoadConfig = (const void *)IntPtr;
+   return Error::success();
+@@ -727,6 +762,14 @@ COFFObjectFile::COFFObjectFile(MemoryBufferRef Object)
+       DebugDirectoryBegin(nullptr), DebugDirectoryEnd(nullptr),
+       TLSDirectory32(nullptr), TLSDirectory64(nullptr) {}
+ 
++static Error ignoreStrippedErrors(Error E) {
++  if (E.isA<SectionStrippedError>()) {
++    consumeError(std::move(E));
++    return Error::success();
++  }
++  return std::move(E);
++}
++
+ Error COFFObjectFile::initialize() {
+   // Check that we at least have enough room for a header.
+   std::error_code EC;
+@@ -839,28 +882,28 @@ Error COFFObjectFile::initialize() {
+   }
+ 
+   // Initialize the pointer to the beginning of the import table.
+-  if (Error E = initImportTablePtr())
++  if (Error E = ignoreStrippedErrors(initImportTablePtr()))
+     return E;
+-  if (Error E = initDelayImportTablePtr())
++  if (Error E = ignoreStrippedErrors(initDelayImportTablePtr()))
+     return E;
+ 
+   // Initialize the pointer to the export table.
+-  if (Error E = initExportTablePtr())
++  if (Error E = ignoreStrippedErrors(initExportTablePtr()))
+     return E;
+ 
+   // Initialize the pointer to the base relocation table.
+-  if (Error E = initBaseRelocPtr())
++  if (Error E = ignoreStrippedErrors(initBaseRelocPtr()))
+     return E;
+ 
+   // Initialize the pointer to the debug directory.
+-  if (Error E = initDebugDirectoryPtr())
++  if (Error E = ignoreStrippedErrors(initDebugDirectoryPtr()))
+     return E;
+ 
+   // Initialize the pointer to the TLS directory.
+-  if (Error E = initTLSDirectoryPtr())
++  if (Error E = ignoreStrippedErrors(initTLSDirectoryPtr()))
+     return E;
+ 
+-  if (Error E = initLoadConfigPtr())
++  if (Error E = ignoreStrippedErrors(initLoadConfigPtr()))
+     return E;
+ 
+   return Error::success();
+diff --git a/llvm/lib/Object/Error.cpp b/llvm/lib/Object/Error.cpp
+index bc75bc6c0445..6d1e3f2a59d0 100644
+--- a/llvm/lib/Object/Error.cpp
++++ b/llvm/lib/Object/Error.cpp
+@@ -52,6 +52,8 @@ std::string _object_error_category::message(int EV) const {
+     return "Bitcode section not found in object file";
+   case object_error::invalid_symbol_index:
+     return "Invalid symbol index";
++  case object_error::section_stripped:
++    return "Section has been stripped from the object file";
+   }
+   llvm_unreachable("An enumerator of object_error does not have a message "
+                    "defined.");
+diff --git a/llvm/test/Object/Inputs/COFF/dwarf-debug-only.yaml b/llvm/test/Object/Inputs/COFF/dwarf-debug-only.yaml
+new file mode 100644
+index 000000000000..8bec59817ff3
+--- /dev/null
++++ b/llvm/test/Object/Inputs/COFF/dwarf-debug-only.yaml
+@@ -0,0 +1,109 @@
++--- !COFF
++OptionalHeader:
++  AddressOfEntryPoint: 4512
++  ImageBase:       6442450944
++  SectionAlignment: 4096
++  FileAlignment:   512
++  MajorOperatingSystemVersion: 6
++  MinorOperatingSystemVersion: 0
++  MajorImageVersion: 0
++  MinorImageVersion: 0
++  MajorSubsystemVersion: 6
++  MinorSubsystemVersion: 0
++  Subsystem:       IMAGE_SUBSYSTEM_WINDOWS_GUI
++  DLLCharacteristics: [ IMAGE_DLL_CHARACTERISTICS_HIGH_ENTROPY_VA, IMAGE_DLL_CHARACTERISTICS_DYNAMIC_BASE, IMAGE_DLL_CHARACTERISTICS_NX_COMPAT ]
++  SizeOfStackReserve: 1048576
++  SizeOfStackCommit: 4096
++  SizeOfHeapReserve: 1048576
++  SizeOfHeapCommit: 4096
++  ExportTable:
++    RelativeVirtualAddress: 6962976
++    Size:            75
++  ImportTable:
++    RelativeVirtualAddress: 6963051
++    Size:            420
++  ResourceTable:
++    RelativeVirtualAddress: 0
++    Size:            0
++  ExceptionTable:
++    RelativeVirtualAddress: 6995968
++    Size:            1812
++  CertificateTable:
++    RelativeVirtualAddress: 0
++    Size:            0
++  BaseRelocationTable:
++    RelativeVirtualAddress: 7004160
++    Size:            156
++  Debug:
++    RelativeVirtualAddress: 6987776
++    Size:            28
++  Architecture:
++    RelativeVirtualAddress: 0
++    Size:            0
++  GlobalPtr:
++    RelativeVirtualAddress: 0
++    Size:            0
++  TlsTable:
++    RelativeVirtualAddress: 6962168
++    Size:            40
++  LoadConfigTable:
++    RelativeVirtualAddress: 0
++    Size:            0
++  BoundImport:
++    RelativeVirtualAddress: 0
++    Size:            0
++  IAT:
++    RelativeVirtualAddress: 6965496
++    Size:            2024
++  DelayImportDescriptor:
++    RelativeVirtualAddress: 0
++    Size:            0
++  ClrRuntimeHeader:
++    RelativeVirtualAddress: 0
++    Size:            0
++header:
++  Machine:         IMAGE_FILE_MACHINE_AMD64
++  Characteristics: [ IMAGE_FILE_EXECUTABLE_IMAGE, IMAGE_FILE_LARGE_ADDRESS_AWARE, IMAGE_FILE_DLL ]
++sections:
++  - Name:            .text
++    Characteristics: [ IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ ]
++    VirtualAddress:  4096
++    VirtualSize:     59030
++    SectionData:     ''
++  - Name:            .rdata
++    Characteristics: [ IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_MEM_READ ]
++    VirtualAddress:  65536
++    VirtualSize:     6919008
++    SectionData:     ''
++  - Name:            .buildid
++    Characteristics: [ IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_MEM_READ ]
++    VirtualAddress:  6987776
++    VirtualSize:     53
++    SectionData:     00000000A9D795620000000002000000190000001CA06A001C040000525344535450075756EAA5DB4C4C44205044422E0100000000
++  - Name:            .data
++    Characteristics: [ IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE ]
++    VirtualAddress:  6991872
++    VirtualSize:     1960
++    SectionData:     ''
++  - Name:            .pdata
++    Characteristics: [ IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_MEM_READ ]
++    VirtualAddress:  6995968
++    VirtualSize:     1812
++    SectionData:     ''
++  - Name:            .tls
++    Characteristics: [ IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE ]
++    VirtualAddress:  7000064
++    VirtualSize:     16
++    SectionData:     ''
++  - Name:            .reloc
++    Characteristics: [ IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_MEM_DISCARDABLE, IMAGE_SCN_MEM_READ ]
++    VirtualAddress:  7004160
++    VirtualSize:     156
++    SectionData:     ''
++  - Name:            .debug_info
++    Characteristics: [ IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_MEM_DISCARDABLE, IMAGE_SCN_MEM_READ ]
++    VirtualAddress:  7008256
++    VirtualSize:     64
++    SectionData:     DEADBEEFBAADF00D
++symbols: []
++...
+diff --git a/llvm/test/Object/coff-dwarf-debug-only.test b/llvm/test/Object/coff-dwarf-debug-only.test
+new file mode 100644
+index 000000000000..1fbc365ef741
+--- /dev/null
++++ b/llvm/test/Object/coff-dwarf-debug-only.test
+@@ -0,0 +1,28 @@
++RUN: yaml2obj %p/Inputs/COFF/dwarf-debug-only.yaml | llvm-objdump -p -h - | FileCheck %s
++
++CHECK:      The Data Directory
++CHECK-NEXT: Entry 0 00000000006a3f20 0000004b Export Directory [.edata (or where ever we found it)]
++CHECK-NEXT: Entry 1 00000000006a3f6b 000001a4 Import Directory [parts of .idata]
++CHECK-NEXT: Entry 2 0000000000000000 00000000 Resource Directory [.rsrc]
++CHECK-NEXT: Entry 3 00000000006ac000 00000714 Exception Directory [.pdata]
++CHECK-NEXT: Entry 4 0000000000000000 00000000 Security Directory
++CHECK-NEXT: Entry 5 00000000006ae000 0000009c Base Relocation Directory [.reloc]
++CHECK-NEXT: Entry 6 00000000006aa000 0000001c Debug Directory
++CHECK-NEXT: Entry 7 0000000000000000 00000000 Description Directory
++CHECK-NEXT: Entry 8 0000000000000000 00000000 Special Directory
++CHECK-NEXT: Entry 9 00000000006a3bf8 00000028 Thread Storage Directory [.tls]
++CHECK-NEXT: Entry a 0000000000000000 00000000 Load Configuration Directory
++CHECK-NEXT: Entry b 0000000000000000 00000000 Bound Import Directory
++CHECK-NEXT: Entry c 00000000006a48f8 000007e8 Import Address Table Directory
++CHECK-NEXT: Entry d 0000000000000000 00000000 Delay Import Directory
++CHECK-NEXT: Entry e 0000000000000000 00000000 CLR Runtime Header
++CHECK-NEXT: Entry f 0000000000000000 00000000 Reserved
++
++CHECK:      0 .text         00000000 0000000180001000 TEXT
++CHECK-NEXT: 1 .rdata        00000000 0000000180010000 DATA
++CHECK-NEXT: 2 .buildid      00000035 00000001806aa000 DATA
++CHECK-NEXT: 3 .data         00000000 00000001806ab000 DATA
++CHECK-NEXT: 4 .pdata        00000000 00000001806ac000 DATA
++CHECK-NEXT: 5 .tls          00000000 00000001806ad000 DATA
++CHECK-NEXT: 6 .reloc        00000000 00000001806ae000 DATA
++CHECK-NEXT: 7 .debug_info   00000040 00000001806af000 DATA, DEBUG
+diff --git a/llvm/tools/llvm-objdump/COFFDump.cpp b/llvm/tools/llvm-objdump/COFFDump.cpp
+index 32fdd1a4d5c3..e085e26c3cd0 100644
+--- a/llvm/tools/llvm-objdump/COFFDump.cpp
++++ b/llvm/tools/llvm-objdump/COFFDump.cpp
+@@ -430,21 +430,12 @@ static void printTLSDirectory(const COFFObjectFile *Obj) {
+   if (!PE32Header && !PE32PlusHeader)
+     return;
+ 
+-  const data_directory *DataDir = Obj->getDataDirectory(COFF::TLS_TABLE);
+-  if (!DataDir || DataDir->RelativeVirtualAddress == 0)
+-    return;
+-
+-  uintptr_t IntPtr = 0;
+-  if (Error E =
+-          Obj->getRvaPtr(DataDir->RelativeVirtualAddress, IntPtr))
+-    reportError(std::move(E), Obj->getFileName());
+-
+   if (PE32Header) {
+-    auto *TLSDir = reinterpret_cast<const coff_tls_directory32 *>(IntPtr);
+-    printTLSDirectoryT(TLSDir);
++    if (auto *TLSDir = Obj->getTLSDirectory32())
++      printTLSDirectoryT(TLSDir);
+   } else {
+-    auto *TLSDir = reinterpret_cast<const coff_tls_directory64 *>(IntPtr);
+-    printTLSDirectoryT(TLSDir);
++    if (auto *TLSDir = Obj->getTLSDirectory64())
++      printTLSDirectoryT(TLSDir);
+   }
+ 
+   outs() << "\n";
+@@ -459,19 +450,10 @@ static void printLoadConfiguration(const COFFObjectFile *Obj) {
+   if (Obj->getMachine() != COFF::IMAGE_FILE_MACHINE_I386)
+     return;
+ 
+-  const data_directory *DataDir = Obj->getDataDirectory(COFF::LOAD_CONFIG_TABLE);
+-  if (!DataDir)
+-    reportError("no load config data dir", Obj->getFileName());
+-
+-  uintptr_t IntPtr = 0;
+-  if (DataDir->RelativeVirtualAddress == 0)
++  auto *LoadConf = Obj->getLoadConfig32();
++  if (!LoadConf)
+     return;
+ 
+-  if (Error E =
+-          Obj->getRvaPtr(DataDir->RelativeVirtualAddress, IntPtr))
+-    reportError(std::move(E), Obj->getFileName());
+-
+-  auto *LoadConf = reinterpret_cast<const coff_load_configuration32 *>(IntPtr);
+   outs() << "Load configuration:"
+          << "\n  Timestamp: " << LoadConf->TimeDateStamp
+          << "\n  Major Version: " << LoadConf->MajorVersion
+@@ -544,11 +526,11 @@ static void printImportTables(const COFFObjectFile *Obj) {
+ // Prints export tables. The export table is a table containing the list of
+ // exported symbol from the DLL.
+ static void printExportTable(const COFFObjectFile *Obj) {
+-  outs() << "Export Table:\n";
+   export_directory_iterator I = Obj->export_directory_begin();
+   export_directory_iterator E = Obj->export_directory_end();
+   if (I == E)
+     return;
++  outs() << "Export Table:\n";
+   StringRef DllName;
+   uint32_t OrdinalBase;
+   if (I->getDllName(DllName))
+-- 
+2.36.1
+

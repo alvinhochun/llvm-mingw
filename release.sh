@@ -23,20 +23,23 @@ fi
 
 TAG=$1
 
-if [ "$2" = "nativeonly" ]; then
-    NATIVEONLY=1
-fi
+# if [ "$2" = "nativeonly" ]; then
+#     NATIVEONLY=1
+# fi
 
-time docker build -f Dockerfile . -t mstorsjo/llvm-mingw:latest -t mstorsjo/llvm-mingw:$TAG
+# time docker build -f Dockerfile . -t mstorsjo/llvm-mingw:latest -t mstorsjo/llvm-mingw:$TAG
 
-DISTRO=ubuntu-18.04-$(uname -m)
-docker run --rm mstorsjo/llvm-mingw:latest sh -c "cd /opt && mv llvm-mingw llvm-mingw-$TAG-ucrt-$DISTRO && tar -Jcvf - llvm-mingw-$TAG-ucrt-$DISTRO" > llvm-mingw-$TAG-ucrt-$DISTRO.tar.xz
+# DISTRO=ubuntu-18.04-$(uname -m)
+# docker run --rm mstorsjo/llvm-mingw:latest sh -c "cd /opt && mv llvm-mingw llvm-mingw-$TAG-ucrt-$DISTRO && tar -Jcvf - llvm-mingw-$TAG-ucrt-$DISTRO" > llvm-mingw-$TAG-ucrt-$DISTRO.tar.xz
 
-if [ -n "$NATIVEONLY" ]; then
-    exit 0
-fi
+# if [ -n "$NATIVEONLY" ]; then
+#     exit 0
+# fi
 
-time docker build -f Dockerfile.dev . -t mstorsjo/llvm-mingw:dev -t mstorsjo/llvm-mingw:dev-$TAG
+# time docker build -f Dockerfile.dev . -t mstorsjo/llvm-mingw:dev -t mstorsjo/llvm-mingw:dev-$TAG
+
+time docker pull mstorsjo/llvm-mingw:dev-20220323
+docker tag mstorsjo/llvm-mingw:dev-20220323 mstorsjo/llvm-mingw:dev
 
 cleanup() {
     for i in $temp_images; do
@@ -46,22 +49,23 @@ cleanup() {
 
 trap cleanup EXIT INT TERM
 
-for arch in i686 x86_64 armv7 aarch64; do
+# for arch in i686 x86_64 armv7 aarch64; do
+for arch in x86_64; do
     temp=$(uuidgen)
     temp_images="$temp_images $temp"
     time docker build -f Dockerfile.cross --build-arg BASE=mstorsjo/llvm-mingw:dev --build-arg CROSS_ARCH=$arch --build-arg TAG=$TAG-ucrt- --build-arg WITH_PYTHON=1 -t $temp .
     ./extract-docker.sh $temp /llvm-mingw-$TAG-ucrt-$arch.zip
 done
 
-msvcrt_image=llvm-mingw-msvcrt-$(uuidgen)
-temp_images="$temp_images $msvcrt_image"
-time docker build -f Dockerfile.dev -t $msvcrt_image --build-arg DEFAULT_CRT=msvcrt .
+# msvcrt_image=llvm-mingw-msvcrt-$(uuidgen)
+# temp_images="$temp_images $msvcrt_image"
+# time docker build -f Dockerfile.dev -t $msvcrt_image --build-arg DEFAULT_CRT=msvcrt .
 
-docker run --rm $msvcrt_image sh -c "cd /opt && mv llvm-mingw llvm-mingw-$TAG-msvcrt-$DISTRO && tar -Jcvf - llvm-mingw-$TAG-msvcrt-$DISTRO" > llvm-mingw-$TAG-msvcrt-$DISTRO.tar.xz
+# docker run --rm $msvcrt_image sh -c "cd /opt && mv llvm-mingw llvm-mingw-$TAG-msvcrt-$DISTRO && tar -Jcvf - llvm-mingw-$TAG-msvcrt-$DISTRO" > llvm-mingw-$TAG-msvcrt-$DISTRO.tar.xz
 
-for arch in i686 x86_64; do
-    temp=$(uuidgen)
-    temp_images="$temp_images $temp"
-    time docker build -f Dockerfile.cross --build-arg BASE=$msvcrt_image --build-arg CROSS_ARCH=$arch --build-arg TAG=$TAG-msvcrt- --build-arg WITH_PYTHON=1 -t $temp .
-    ./extract-docker.sh $temp /llvm-mingw-$TAG-msvcrt-$arch.zip
-done
+# for arch in i686 x86_64; do
+#     temp=$(uuidgen)
+#     temp_images="$temp_images $temp"
+#     time docker build -f Dockerfile.cross --build-arg BASE=$msvcrt_image --build-arg CROSS_ARCH=$arch --build-arg TAG=$TAG-msvcrt- --build-arg WITH_PYTHON=1 -t $temp .
+#     ./extract-docker.sh $temp /llvm-mingw-$TAG-msvcrt-$arch.zip
+# done

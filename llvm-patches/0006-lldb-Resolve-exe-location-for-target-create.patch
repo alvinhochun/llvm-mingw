@@ -1,0 +1,80 @@
+From fbbafd350f99ff18be6946a400cc406cdbf0e278 Mon Sep 17 00:00:00 2001
+From: Alvin Wong <alvin@alvinhc.com>
+Date: Fri, 10 Jun 2022 03:05:05 +0800
+Subject: [PATCH 6/6] [lldb] Resolve exe location for `target create`
+
+This fixes an issue that, when you start lldb or use `target create`
+with a program name which is on $PATH, or not specify the .exe suffix of
+a program in the working directory on Windows, you get a confusing
+error, for example:
+
+    (lldb) target create notepad
+    error: 'C:\WINDOWS\SYSTEM32\notepad.exe' doesn't contain any 'host'
+    platform architectures: i686, x86_64, i386, i386
+
+Fixes https://github.com/mstorsjo/llvm-mingw/issues/265
+
+Differential Revision: https://reviews.llvm.org/D127436
+---
+ lldb/source/Commands/CommandObjectTarget.cpp | 18 ++++++++++++------
+ lldb/source/Target/TargetList.cpp            |  8 ++++++++
+ 2 files changed, 20 insertions(+), 6 deletions(-)
+
+diff --git a/lldb/source/Commands/CommandObjectTarget.cpp b/lldb/source/Commands/CommandObjectTarget.cpp
+index 157065bde10e..bb8db4b13c62 100644
+--- a/lldb/source/Commands/CommandObjectTarget.cpp
++++ b/lldb/source/Commands/CommandObjectTarget.cpp
+@@ -296,12 +296,6 @@ protected:
+ 
+       const char *file_path = command.GetArgumentAtIndex(0);
+       LLDB_SCOPED_TIMERF("(lldb) target create '%s'", file_path);
+-      FileSpec file_spec;
+-
+-      if (file_path) {
+-        file_spec.SetFile(file_path, FileSpec::Style::native);
+-        FileSystem::Instance().Resolve(file_spec);
+-      }
+ 
+       bool must_set_platform_path = false;
+ 
+@@ -330,6 +324,18 @@ protected:
+ 
+       PlatformSP platform_sp = target_sp->GetPlatform();
+ 
++      FileSpec file_spec;
++      if (file_path) {
++        file_spec.SetFile(file_path, FileSpec::Style::native);
++        FileSystem::Instance().Resolve(file_spec);
++
++        // Try to resolve the exe based on PATH and/or platform-specific
++        // suffixes, but only if using the host platform.
++        if (platform_sp && platform_sp->IsHost() &&
++            !FileSystem::Instance().Exists(file_spec))
++          FileSystem::Instance().ResolveExecutableLocation(file_spec);
++      }
++
+       if (remote_file) {
+         if (platform_sp) {
+           // I have a remote file.. two possible cases
+diff --git a/lldb/source/Target/TargetList.cpp b/lldb/source/Target/TargetList.cpp
+index 595799cfc92a..237d4156ed95 100644
+--- a/lldb/source/Target/TargetList.cpp
++++ b/lldb/source/Target/TargetList.cpp
+@@ -120,6 +120,14 @@ Status TargetList::CreateTargetInternal(
+   if (!user_exe_path.empty()) {
+     ModuleSpec module_spec(FileSpec(user_exe_path, FileSpec::Style::native));
+     FileSystem::Instance().Resolve(module_spec.GetFileSpec());
++
++    // Try to resolve the exe based on PATH and/or platform-specific suffixes,
++    // but only if using the host platform.
++    if (platform_sp->IsHost() &&
++        !FileSystem::Instance().Exists(module_spec.GetFileSpec()))
++      FileSystem::Instance().ResolveExecutableLocation(
++          module_spec.GetFileSpec());
++
+     // Resolve the executable in case we are given a path to a application
+     // bundle like a .app bundle on MacOSX.
+     Host::ResolveExecutableInBundle(module_spec.GetFileSpec());
+-- 
+2.36.1
+
