@@ -35,4 +35,4 @@ jobs:
         uses: actions/upload-artifact@v3
         with:
           name: llvm-mingw
-          path: llvm-mingw-$TAG-ucrt-x86_64.zip
+          path: llvm-mingw-${{ env.MY_VAR }}-ucrt-x86_64.zip
