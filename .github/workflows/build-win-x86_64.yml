@@ -1,6 +1,4 @@
-# This is a basic workflow to help you get started with Actions
-
-name: CI
+name: Build Windows x86_64 native toolchain
 
 # Controls when the workflow will run
 on:
@@ -28,11 +26,33 @@ jobs:
       # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
       - uses: actions/checkout@v3
 
-      - name: Build x86_64 toolchain
-        run: bash release.sh "$TAG"
+      - name: Download llvm-mingw cross toolchain
+        run: |
+          curl -L https://github.com/mstorsjo/llvm-mingw/releases/download/20220323/llvm-mingw-20220323-ucrt-ubuntu-18.04-x86_64.tar.xz | tar -Jxv
+          mv llvm-mingw-20220323-ucrt-ubuntu-18.04-x86_64 llvm-mingw-cross
 
+      - name: Install apt dependencies
+        run: sudo apt-get install -qqy libltdl-dev swig autoconf-archive ninja-build p7zip-full
+
+      - name: Prepare git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Cross build x86_64 toolchain
+        run: ./build-cross-tools.sh $PWD/llvm-mingw-cross $PWD/cross-prefix x86_64 --with-python
+
+      - name: Package toolchain
+        run: |
+          export TOOLCHAIN_NAME=llvm-mingw-$TAG-ucrt-x86_64
+          ln -s $PWD/cross-prefix $TOOLCHAIN_NAME
+          # zip -9r $TOOLCHAIN_NAME.zip $TOOLCHAIN_NAME
+          7za a -t7z -mx=9 -ms=on $TOOLCHAIN_NAME.7z $TOOLCHAIN_NAME
+          ls -lh $TOOLCHAIN_NAME.7z
+
+      # This will produce a 7z inside a zip
       - name: Upload toolchain artifact
         uses: actions/upload-artifact@v3
         with:
-          name: llvm-mingw
-          path: llvm-mingw-${{ env.MY_VAR }}-ucrt-x86_64.zip
+          name: llvm-mingw-${{ env.TAG }}-ucrt-x86_64.7z
+          path: llvm-mingw-${{ env.TAG }}-ucrt-x86_64.7z
