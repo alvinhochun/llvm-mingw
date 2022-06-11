@@ -47,7 +47,7 @@ jobs:
           export TOOLCHAIN_NAME=llvm-mingw-$TAG-ucrt-x86_64
           ln -s $PWD/cross-prefix $TOOLCHAIN_NAME
           # zip -9r $TOOLCHAIN_NAME.zip $TOOLCHAIN_NAME
-          7za a -t7z -mx=9 -ms=on $TOOLCHAIN_NAME.7z $TOOLCHAIN_NAME
+          7za a -t7z -l -mx=9 -myx=9 -ms=on $TOOLCHAIN_NAME.7z $TOOLCHAIN_NAME
           ls -lh $TOOLCHAIN_NAME.7z
 
       # This will produce a 7z inside a zip
