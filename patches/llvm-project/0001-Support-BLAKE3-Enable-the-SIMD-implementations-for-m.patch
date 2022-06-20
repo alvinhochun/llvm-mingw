@@ -1,0 +1,249 @@
+From 4bb3d8978772292fea46a4eb1db46f9f915886ab Mon Sep 17 00:00:00 2001
+From: Argyrios Kyrtzidis <kyrtzidis@apple.com>
+Date: Mon, 20 Jun 2022 10:13:53 +0300
+Subject: [PATCH] [Support/BLAKE3] Enable the SIMD implementations for macOS
+ universal builds
+
+To accomodate macOS universal configuration include the assembly files
+and `blake3_neon.c` without a CMake check but instead guard their source
+with architecture "#ifdef" checks.
+
+Differential Revision: https://reviews.llvm.org/D128132
+---
+ llvm/lib/Support/BLAKE3/CMakeLists.txt        | 115 +++++++++---------
+ .../Support/BLAKE3/blake3_avx2_x86-64_unix.S  |   3 +
+ .../BLAKE3/blake3_avx512_x86-64_unix.S        |   4 +
+ llvm/lib/Support/BLAKE3/blake3_neon.c         |   4 +
+ .../Support/BLAKE3/blake3_sse2_x86-64_unix.S  |   4 +
+ .../Support/BLAKE3/blake3_sse41_x86-64_unix.S |   4 +
+ 6 files changed, 75 insertions(+), 59 deletions(-)
+
+diff --git a/llvm/lib/Support/BLAKE3/CMakeLists.txt b/llvm/lib/Support/BLAKE3/CMakeLists.txt
+index 3a98dbc3fd27..142e8c68d052 100644
+--- a/llvm/lib/Support/BLAKE3/CMakeLists.txt
++++ b/llvm/lib/Support/BLAKE3/CMakeLists.txt
+@@ -2,6 +2,7 @@ set(LLVM_BLAKE3_FILES
+   blake3.c
+   blake3_dispatch.c
+   blake3_portable.c
++  blake3_neon.c
+ )
+ 
+ if (LLVM_DISABLE_ASSEMBLY_FILES)
+@@ -10,6 +11,10 @@ else()
+   set(CAN_USE_ASSEMBLER TRUE)
+ endif()
+ 
++macro(disable_blake3_x86_simd)
++  add_definitions(-DBLAKE3_NO_AVX512 -DBLAKE3_NO_AVX2 -DBLAKE3_NO_SSE41 -DBLAKE3_NO_SSE2)
++endmacro()
++
+ # The BLAKE3 team recommends using the assembly versions, from the README:
+ #
+ # "For each of the x86 SIMD instruction sets, four versions are available:
+@@ -18,70 +23,62 @@ endif()
+ # preferred. They perform better, they perform more consistently across
+ # different compilers, and they build more quickly."
+ 
+-if (MSVC)
+-  check_symbol_exists(_M_X64 "" IS_X64)
+-  check_symbol_exists(_M_ARM64 "" IS_ARM64)
+-else()
+-  check_symbol_exists(__x86_64__ "" IS_X64)
+-  check_symbol_exists(__aarch64__ "" IS_ARM64)
+-
+-  if (IS_X64)
+-    # Clang-6 needs this flag.
+-    set_source_files_properties(blake3_avx512_x86-64_windows_gnu.S
+-      PROPERTIES COMPILE_OPTIONS "-mavx512vl")
+-    set_source_files_properties(blake3_avx512_x86-64_unix.S
+-      PROPERTIES COMPILE_OPTIONS "-mavx512vl")
+-  endif()
+-endif()
+-
+-if (IS_X64 AND CAN_USE_ASSEMBLER)
++if (CAN_USE_ASSEMBLER)
+   if (MSVC)
+-    enable_language(ASM_MASM)
+-    list(APPEND LLVM_BLAKE3_FILES
+-      blake3_sse2_x86-64_windows_msvc.asm
+-      blake3_sse41_x86-64_windows_msvc.asm
+-      blake3_avx2_x86-64_windows_msvc.asm
+-      blake3_avx512_x86-64_windows_msvc.asm
+-    )
++    check_symbol_exists(_M_X64 "" IS_X64)
++    if (IS_X64)
++      enable_language(ASM_MASM)
++      list(APPEND LLVM_BLAKE3_FILES
++        blake3_sse2_x86-64_windows_msvc.asm
++        blake3_sse41_x86-64_windows_msvc.asm
++        blake3_avx2_x86-64_windows_msvc.asm
++        blake3_avx512_x86-64_windows_msvc.asm
++      )
++    else()
++      disable_blake3_x86_simd()
++    endif()
+   elseif(WIN32 OR CYGWIN)
+-    list(APPEND LLVM_BLAKE3_FILES
+-      blake3_sse2_x86-64_windows_gnu.S
+-      blake3_sse41_x86-64_windows_gnu.S
+-      blake3_avx2_x86-64_windows_gnu.S
+-      blake3_avx512_x86-64_windows_gnu.S
+-    )
++    check_symbol_exists(__x86_64__ "" IS_X64)
++    if (IS_X64)
++      list(APPEND LLVM_BLAKE3_FILES
++        blake3_sse2_x86-64_windows_gnu.S
++        blake3_sse41_x86-64_windows_gnu.S
++        blake3_avx2_x86-64_windows_gnu.S
++        blake3_avx512_x86-64_windows_gnu.S
++      )
++      # Clang-6 needs this flag.
++      set_source_files_properties(blake3_avx512_x86-64_windows_gnu.S
++        PROPERTIES COMPILE_OPTIONS "-mavx512vl")
++    else()
++      disable_blake3_x86_simd()
++    endif()
+   else()
+-    list(APPEND LLVM_BLAKE3_FILES
+-      blake3_sse2_x86-64_unix.S
+-      blake3_sse41_x86-64_unix.S
+-      blake3_avx2_x86-64_unix.S
+-      blake3_avx512_x86-64_unix.S
+-    )
++    check_symbol_exists(__i386__ "" IS_X32)
++    if (IS_X32)
++      # blake3 C code autoenables SIMD for i386, but those implementations are
++      # only available via the intrinsics sources which we don't enable here.
++      disable_blake3_x86_simd()
++    else()
++      # In a macOS Universal build (setting CMAKE_OSX_ARCHITECTURES to multiple
++      # values), compilation of the source files will target multiple architectures
++      # (each source file is internally compiled once for each architecture).
++      # To accomodate this configuration we include these assembly files without a
++      # CMake check but their source is guarded with architecture "#ifdef" checks.
++      list(APPEND LLVM_BLAKE3_FILES
++        blake3_sse2_x86-64_unix.S
++        blake3_sse41_x86-64_unix.S
++        blake3_avx2_x86-64_unix.S
++        blake3_avx512_x86-64_unix.S
++      )
++      # Clang-6 needs this flag. We also suppress '-Wunused-command-line-argument'
++      # in case the file is included with arm architecture.
++      set_source_files_properties(blake3_avx512_x86-64_unix.S
++        PROPERTIES COMPILE_OPTIONS "-mavx512vl;-Wno-unused-command-line-argument")
++    endif()
+   endif()
+ else()
+-  # In a macOS Universal build (setting CMAKE_OSX_ARCHITECTURES to multiple
+-  # values), IS_X64 and IS_ARM64 won't be set, but compilation of the source
+-  # files will consider targeting either of them (each source file is
+-  # internally compiled once for each architecture). Thus, if we on the CMake
+-  # level decide not to include the assembly files, tell the source to not
+-  # expect it to be present either.
+-  #
+-  # Also, if targeting i386, then the blake3 source code automatically enables
+-  # the SIMD implementations, but we don't provide those sources.
+-  #
+-  # FIXME: We could improve the CMAKE_OSX_ARCHITECTURES configuration by
+-  # including all SIMD implementation files that might be relevant, and
+-  # wrapping them in ifdefs like "#ifdef __x86_64__", to allow them to be
+-  # included in a build for any architecture.
+-  add_definitions(-DBLAKE3_NO_AVX512 -DBLAKE3_NO_AVX2 -DBLAKE3_NO_SSE41 -DBLAKE3_NO_SSE2)
+-endif()
+-
+-if (IS_ARM64)
+-  list(APPEND LLVM_BLAKE3_FILES
+-    blake3_neon.c
+-  )
+-else()
+-  add_definitions(-DBLAKE3_USE_NEON=0)
++  # CAN_USE_ASSEMBLER == FALSE
++  disable_blake3_x86_simd()
+ endif()
+ 
+ add_library(LLVMSupportBlake3 OBJECT EXCLUDE_FROM_ALL ${LLVM_BLAKE3_FILES})
+diff --git a/llvm/lib/Support/BLAKE3/blake3_avx2_x86-64_unix.S b/llvm/lib/Support/BLAKE3/blake3_avx2_x86-64_unix.S
+index 9e7962a80970..449e07492832 100644
+--- a/llvm/lib/Support/BLAKE3/blake3_avx2_x86-64_unix.S
++++ b/llvm/lib/Support/BLAKE3/blake3_avx2_x86-64_unix.S
+@@ -1,3 +1,5 @@
++#if defined(__x86_64__)
++
+ #if defined(__ELF__) && defined(__linux__)
+ .section .note.GNU-stack,"",%progbits
+ #endif
+@@ -1821,3 +1823,4 @@ CMP_MSB_MASK:
+ BLAKE3_IV:
+         .long  0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A
+ 
++#endif
+diff --git a/llvm/lib/Support/BLAKE3/blake3_avx512_x86-64_unix.S b/llvm/lib/Support/BLAKE3/blake3_avx512_x86-64_unix.S
+index b2376b986b6b..3afc0e2250e2 100644
+--- a/llvm/lib/Support/BLAKE3/blake3_avx512_x86-64_unix.S
++++ b/llvm/lib/Support/BLAKE3/blake3_avx512_x86-64_unix.S
+@@ -1,3 +1,5 @@
++#if defined(__x86_64__)
++
+ #if defined(__ELF__) && defined(__linux__)
+ .section .note.GNU-stack,"",%progbits
+ #endif
+@@ -2595,3 +2597,5 @@ BLAKE3_IV_2:
+         .long   0x3C6EF372
+ BLAKE3_IV_3:
+         .long   0xA54FF53A
++
++#endif
+diff --git a/llvm/lib/Support/BLAKE3/blake3_neon.c b/llvm/lib/Support/BLAKE3/blake3_neon.c
+index 51fb7473d83a..380bbfc3e466 100644
+--- a/llvm/lib/Support/BLAKE3/blake3_neon.c
++++ b/llvm/lib/Support/BLAKE3/blake3_neon.c
+@@ -1,5 +1,7 @@
+ #include "blake3_impl.h"
+ 
++#if BLAKE3_USE_NEON
++
+ #include <arm_neon.h>
+ 
+ #ifdef __ARM_BIG_ENDIAN
+@@ -350,3 +352,5 @@ void blake3_hash_many_neon(const uint8_t *const *inputs, size_t num_inputs,
+     out = &out[BLAKE3_OUT_LEN];
+   }
+ }
++
++#endif // BLAKE3_USE_NEON
+diff --git a/llvm/lib/Support/BLAKE3/blake3_sse2_x86-64_unix.S b/llvm/lib/Support/BLAKE3/blake3_sse2_x86-64_unix.S
+index c30bd7372110..0106b13ba851 100644
+--- a/llvm/lib/Support/BLAKE3/blake3_sse2_x86-64_unix.S
++++ b/llvm/lib/Support/BLAKE3/blake3_sse2_x86-64_unix.S
+@@ -1,3 +1,5 @@
++#if defined(__x86_64__)
++
+ #if defined(__ELF__) && defined(__linux__)
+ .section .note.GNU-stack,"",%progbits
+ #endif
+@@ -2301,3 +2303,5 @@ PBLENDW_0x3F_MASK:
+ 	.long  0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x00000000
+ PBLENDW_0xC0_MASK:
+ 	.long  0x00000000, 0x00000000, 0x00000000, 0xFFFFFFFF
++
++#endif
+diff --git a/llvm/lib/Support/BLAKE3/blake3_sse41_x86-64_unix.S b/llvm/lib/Support/BLAKE3/blake3_sse41_x86-64_unix.S
+index b3f35eee57ac..4e918c5bb2cc 100644
+--- a/llvm/lib/Support/BLAKE3/blake3_sse41_x86-64_unix.S
++++ b/llvm/lib/Support/BLAKE3/blake3_sse41_x86-64_unix.S
+@@ -1,3 +1,5 @@
++#if defined(__x86_64__)
++
+ #if defined(__ELF__) && defined(__linux__)
+ .section .note.GNU-stack,"",%progbits
+ #endif
+@@ -2038,3 +2040,5 @@ BLAKE3_BLOCK_LEN:
+ 	.long  64, 64, 64, 64
+ CMP_MSB_MASK:
+ 	.long  0x80000000, 0x80000000, 0x80000000, 0x80000000
++
++#endif
+-- 
+2.25.1
+
