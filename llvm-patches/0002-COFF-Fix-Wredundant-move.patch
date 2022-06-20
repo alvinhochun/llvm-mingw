@@ -1,7 +1,7 @@
 From 216257fef702252222bdf6d3c475986308e14286 Mon Sep 17 00:00:00 2001
 From: Benjamin Kramer <benny.kra@googlemail.com>
 Date: Fri, 3 Jun 2022 17:39:08 +0200
-Subject: [PATCH 2/8] [COFF] Fix -Wredundant-move
+Subject: [PATCH 2/9] [COFF] Fix -Wredundant-move
 
 ---
  llvm/lib/Object/COFFObjectFile.cpp | 2 +-

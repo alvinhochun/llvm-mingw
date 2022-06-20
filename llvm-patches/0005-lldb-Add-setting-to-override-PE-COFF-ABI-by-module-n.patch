@@ -1,7 +1,7 @@
 From 396e45ae89668be675ecb0247b066b806989ed1a Mon Sep 17 00:00:00 2001
 From: Alvin Wong <alvin@alvinhc.com>
 Date: Tue, 7 Jun 2022 19:10:49 +0800
-Subject: [PATCH 5/8] [lldb] Add setting to override PE/COFF ABI by module name
+Subject: [PATCH 5/9] [lldb] Add setting to override PE/COFF ABI by module name
 
 The setting `plugin.object-file.pe-coff.module-abi` is a string-to-enum
 map that allows specifying an ABI to a module name. For example:

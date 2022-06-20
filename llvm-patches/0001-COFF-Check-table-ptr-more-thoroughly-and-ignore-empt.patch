@@ -1,7 +1,7 @@
 From ca33f19bdb3f9486689abf8937e776a6177c86d8 Mon Sep 17 00:00:00 2001
 From: Alvin Wong <alvin@alvinhc.com>
 Date: Fri, 3 Jun 2022 17:57:57 +0300
-Subject: [PATCH 1/8] [COFF] Check table ptr more thoroughly and ignore empty
+Subject: [PATCH 1/9] [COFF] Check table ptr more thoroughly and ignore empty
  sections
 
 When loading split debug files for PE/COFF executables (produced with

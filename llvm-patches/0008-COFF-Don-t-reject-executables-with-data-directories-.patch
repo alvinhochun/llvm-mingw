@@ -1,7 +1,7 @@
 From 0c55924a7834bdd7121ae80e258201a6dfc5feab Mon Sep 17 00:00:00 2001
 From: Martin Storsj <martin@martin.st>
 Date: Fri, 10 Jun 2022 23:09:11 +0800
-Subject: [PATCH 8/8] [COFF] Don't reject executables with data directories
+Subject: [PATCH 8/9] [COFF] Don't reject executables with data directories
  pointing outside of provided data
 
 Before bb94611d6545c2c5271f5bb01de1aa4228a37250, we didn't check

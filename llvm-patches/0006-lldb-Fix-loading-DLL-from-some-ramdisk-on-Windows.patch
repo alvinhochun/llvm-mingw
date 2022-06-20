@@ -1,7 +1,7 @@
 From c8a7c267e2c9c4e5e9f4f51d8862ee51d4302995 Mon Sep 17 00:00:00 2001
 From: Alvin Wong <alvin@alvinhc.com>
 Date: Mon, 30 May 2022 23:04:58 +0800
-Subject: [PATCH 6/8] [lldb] Fix loading DLL from some ramdisk on Windows
+Subject: [PATCH 6/9] [lldb] Fix loading DLL from some ramdisk on Windows
 
 The WinAPI `GetFinalPathNameByHandle` is used to retrieve the DLL file
 name from the HANDLE provided to `LOAD_DLL_DEBUG_EVENT` in the debug
