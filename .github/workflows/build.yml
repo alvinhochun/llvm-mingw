@@ -191,17 +191,17 @@ jobs:
       - uses: actions/checkout@v2
       - name: Build
         run: |
-          sudo apt-get update && sudo apt-get install autoconf-archive ninja-build
+          sudo apt-get update && sudo apt-get install autoconf-archive ninja-build p7zip-full
           git config --global user.name "LLVM MinGW"
           git config --global user.email root@localhost
           ./build-cross-tools.sh /opt/llvm-mingw $(pwd)/install/llvm-mingw-${{matrix.arch}} ${{matrix.arch}} --with-python
           cd install
-          zip -9rq ../llvm-mingw-${{matrix.arch}}.zip llvm-mingw-${{matrix.arch}}
+          7za a -t7z -l -mx=9 -myx=9 -ms=on ../llvm-mingw-${{matrix.arch}}.7z llvm-mingw-${{matrix.arch}}
       - uses: actions/upload-artifact@v2
         with:
           name: windows-${{matrix.arch}}-toolchain
           path: |
-            llvm-mingw-${{matrix.arch}}.zip
+            llvm-mingw-${{matrix.arch}}.7z
           retention-days: 7
 
   # Run llvm-mingw's tests on x86_64 (and i686) with the cross-built x86_64
@@ -224,8 +224,8 @@ jobs:
           name: windows-x86_64-toolchain
       - name: Unpack toolchain
         run: |
-          unzip -q llvm-mingw-x86_64.zip
-          rm llvm-mingw-x86_64.zip
+          7z x llvm-mingw-x86_64.7z
+          rm llvm-mingw-x86_64.7z
           mv llvm-mingw-* /llvm-mingw
           echo /llvm-mingw/bin >> $GITHUB_PATH
       - uses: actions/checkout@v2
