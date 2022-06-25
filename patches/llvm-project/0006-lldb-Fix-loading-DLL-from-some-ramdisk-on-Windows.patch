@@ -1,0 +1,148 @@
+From c8a7c267e2c9c4e5e9f4f51d8862ee51d4302995 Mon Sep 17 00:00:00 2001
+From: Alvin Wong <alvin@alvinhc.com>
+Date: Mon, 30 May 2022 23:04:58 +0800
+Subject: [PATCH 6/9] [lldb] Fix loading DLL from some ramdisk on Windows
+
+The WinAPI `GetFinalPathNameByHandle` is used to retrieve the DLL file
+name from the HANDLE provided to `LOAD_DLL_DEBUG_EVENT` in the debug
+loop. When this API fails, lldb will simply ignore that module.
+
+Certain ramdisk (e.g. ImDisk) does not work with this API, which means
+it is impossible to use lldb to debug a process which loads DLLs located
+on this type of ramdisk. In order to make this work, we need to use a
+fallback routine which involves creating a file mapping, using
+`GetMappedFileName` to get a device path, then substitutes the device
+path with its drive letter.
+
+References:
+* https://developercommunity.visualstudio.com/t/cannot-debug-program-when-compiled-to-ram-drive/43004#T-N109926
+* https://github.com/jrfonseca/drmingw/issues/65
+* https://docs.microsoft.com/en-us/windows/win32/memory/obtaining-a-file-name-from-a-file-handle
+
+Differential Revision: https://reviews.llvm.org/D126657
+---
+ .../Process/Windows/Common/DebuggerThread.cpp | 80 +++++++++++++++++--
+ 1 file changed, 72 insertions(+), 8 deletions(-)
+
+diff --git a/lldb/source/Plugins/Process/Windows/Common/DebuggerThread.cpp b/lldb/source/Plugins/Process/Windows/Common/DebuggerThread.cpp
+index a78ca2aabe13..545b189b51eb 100644
+--- a/lldb/source/Plugins/Process/Windows/Common/DebuggerThread.cpp
++++ b/lldb/source/Plugins/Process/Windows/Common/DebuggerThread.cpp
+@@ -13,6 +13,7 @@
+ #include "lldb/Core/ModuleSpec.h"
+ #include "lldb/Host/ProcessLaunchInfo.h"
+ #include "lldb/Host/ThreadLauncher.h"
++#include "lldb/Host/windows/AutoHandle.h"
+ #include "lldb/Host/windows/HostProcessWindows.h"
+ #include "lldb/Host/windows/HostThreadWindows.h"
+ #include "lldb/Host/windows/ProcessLauncherWindows.h"
+@@ -29,6 +30,8 @@
+ #include "llvm/Support/Threading.h"
+ #include "llvm/Support/raw_ostream.h"
+ 
++#include <psapi.h>
++
+ #ifndef STATUS_WX86_BREAKPOINT
+ #define STATUS_WX86_BREAKPOINT 0x4000001FL // For WOW64
+ #endif
+@@ -447,6 +450,60 @@ DebuggerThread::HandleExitProcessEvent(const EXIT_PROCESS_DEBUG_INFO &info,
+   return DBG_CONTINUE;
+ }
+ 
++static llvm::Optional<std::string> GetFileNameFromHandleFallback(HANDLE hFile) {
++  // Check that file is not empty as we cannot map a file with zero length.
++  DWORD dwFileSizeHi = 0;
++  DWORD dwFileSizeLo = ::GetFileSize(hFile, &dwFileSizeHi);
++  if (dwFileSizeLo == 0 && dwFileSizeHi == 0)
++    return llvm::None;
++
++  AutoHandle filemap(
++      ::CreateFileMappingW(hFile, nullptr, PAGE_READONLY, 0, 1, NULL), nullptr);
++  if (!filemap.IsValid())
++    return llvm::None;
++
++  auto view_deleter = [](void *pMem) { ::UnmapViewOfFile(pMem); };
++  std::unique_ptr<void, decltype(view_deleter)> pMem(
++      ::MapViewOfFile(filemap.get(), FILE_MAP_READ, 0, 0, 1), view_deleter);
++  if (!pMem)
++    return llvm::None;
++
++  std::array<wchar_t, MAX_PATH + 1> mapped_filename;
++  if (!::GetMappedFileNameW(::GetCurrentProcess(), pMem.get(),
++                            mapped_filename.data(), mapped_filename.size()))
++    return llvm::None;
++
++  // A series of null-terminated strings, plus an additional null character
++  std::array<wchar_t, 512> drive_strings;
++  drive_strings[0] = L'\0';
++  if (!::GetLogicalDriveStringsW(drive_strings.size(), drive_strings.data()))
++    return llvm::None;
++
++  std::array<wchar_t, 3> drive = {L"_:"};
++  for (auto it = drive_strings.cbegin(); *it != L'\0'; it += wcslen(it) + 1) {
++    // Copy the drive letter to the template string
++    drive[0] = it[0];
++    std::array<wchar_t, MAX_PATH> device_name;
++    if (::QueryDosDeviceW(drive.data(), device_name.data(),
++                          device_name.size())) {
++      size_t device_name_len = wcslen(device_name.data());
++      if (device_name_len < mapped_filename.size()) {
++        bool match = _wcsnicmp(mapped_filename.data(), device_name.data(),
++                               device_name_len) == 0;
++        if (match && mapped_filename[device_name_len] == L'\\') {
++          // Replace device path with its drive letter
++          std::wstring rebuilt_path(drive.data());
++          rebuilt_path.append(&mapped_filename[device_name_len]);
++          std::string path_utf8;
++          llvm::convertWideToUTF8(rebuilt_path, path_utf8);
++          return path_utf8;
++        }
++      }
++    }
++  }
++  return llvm::None;
++}
++
+ DWORD
+ DebuggerThread::HandleLoadDllEvent(const LOAD_DLL_DEBUG_INFO &info,
+                                    DWORD thread_id) {
+@@ -458,6 +515,17 @@ DebuggerThread::HandleLoadDllEvent(const LOAD_DLL_DEBUG_INFO &info,
+     return DBG_CONTINUE;
+   }
+ 
++  auto on_load_dll = [&](llvm::StringRef path) {
++    FileSpec file_spec(path);
++    ModuleSpec module_spec(file_spec);
++    lldb::addr_t load_addr = reinterpret_cast<lldb::addr_t>(info.lpBaseOfDll);
++
++    LLDB_LOG(log, "Inferior {0} - DLL '{1}' loaded at address {2:x}...",
++             m_process.GetProcessId(), path, info.lpBaseOfDll);
++
++    m_debug_delegate->OnLoadDll(module_spec, load_addr);
++  };
++
+   std::vector<wchar_t> buffer(1);
+   DWORD required_size =
+       GetFinalPathNameByHandleW(info.hFile, &buffer[0], 0, VOLUME_NAME_DOS);
+@@ -472,14 +540,10 @@ DebuggerThread::HandleLoadDllEvent(const LOAD_DLL_DEBUG_INFO &info,
+     if (path_str.startswith("\\\\?\\"))
+       path += 4;
+ 
+-    FileSpec file_spec(path);
+-    ModuleSpec module_spec(file_spec);
+-    lldb::addr_t load_addr = reinterpret_cast<lldb::addr_t>(info.lpBaseOfDll);
+-
+-    LLDB_LOG(log, "Inferior {0} - DLL '{1}' loaded at address {2:x}...",
+-             m_process.GetProcessId(), path, info.lpBaseOfDll);
+-
+-    m_debug_delegate->OnLoadDll(module_spec, load_addr);
++    on_load_dll(path);
++  } else if (llvm::Optional<std::string> path =
++                 GetFileNameFromHandleFallback(info.hFile)) {
++    on_load_dll(*path);
+   } else {
+     LLDB_LOG(
+         log,
+-- 
+2.36.1
+

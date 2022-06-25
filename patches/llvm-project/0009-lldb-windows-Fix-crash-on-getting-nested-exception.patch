@@ -1,0 +1,88 @@
+From a153d8ef81ffa1066fa7eb391ce4b4504f30fb9f Mon Sep 17 00:00:00 2001
+From: Alvin Wong <alvin@alvinhc.com>
+Date: Mon, 20 Jun 2022 21:30:03 +0800
+Subject: [PATCH 9/9] [lldb][windows] Fix crash on getting nested exception
+
+LLDB tries to follow `EXCEPTION_RECORD::ExceptionRecord` to follow the
+nested exception chain. In practice this code just causes Access
+Violation whenever there is a nested exception. Since there does not
+appear to be any code in LLDB that is actually using the nested
+exceptions, this change just disables the crashing code and adds a
+comment to clarify the reason.
+
+Fixes https://github.com/mstorsjo/llvm-mingw/issues/292
+
+Differential Revision: https://reviews.llvm.org/D128201
+---
+ .../Process/Windows/Common/ExceptionRecord.h    | 17 ++++++++++++++++-
+ 1 file changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/lldb/source/Plugins/Process/Windows/Common/ExceptionRecord.h b/lldb/source/Plugins/Process/Windows/Common/ExceptionRecord.h
+index d1692a6926b2..b92a26a87e68 100644
+--- a/lldb/source/Plugins/Process/Windows/Common/ExceptionRecord.h
++++ b/lldb/source/Plugins/Process/Windows/Common/ExceptionRecord.h
+@@ -27,9 +27,19 @@ public:
+   ExceptionRecord(const EXCEPTION_RECORD &record, lldb::tid_t thread_id) {
+     m_code = record.ExceptionCode;
+     m_continuable = (record.ExceptionFlags == 0);
++    // This marks some old code which tried to parse the nested exception. In
++    // practice, this code just causes Access Violation. I suspect
++    // `ExceptionRecord` here actually points to the address space of the
++    // debuggee process. However, I did not manage to find any official or
++    // unofficial reference that clarifies this point. If anyone would like to
++    // reimplement this, please also keep in mind to check how this behaves when
++    // debugging a WOW64 process. I suspect you may have to use the explicit
++    // `EXCEPTION_RECORD32` and `EXCEPTION_RECORD64` structs.
++#if 0
+     if (record.ExceptionRecord)
+       m_next_exception.reset(
+           new ExceptionRecord(*record.ExceptionRecord, thread_id));
++#endif
+     m_exception_addr = reinterpret_cast<lldb::addr_t>(record.ExceptionAddress);
+     m_thread_id = thread_id;
+     m_arguments.assign(record.ExceptionInformation,
+@@ -39,17 +49,18 @@ public:
+   // MINIDUMP_EXCEPTIONs are almost identical to EXCEPTION_RECORDs.
+   ExceptionRecord(const MINIDUMP_EXCEPTION &record, lldb::tid_t thread_id)
+       : m_code(record.ExceptionCode), m_continuable(record.ExceptionFlags == 0),
+-        m_next_exception(nullptr),
+         m_exception_addr(static_cast<lldb::addr_t>(record.ExceptionAddress)),
+         m_thread_id(thread_id),
+         m_arguments(record.ExceptionInformation,
+                     record.ExceptionInformation + record.NumberParameters) {
++#if 0
+     // Set up link to nested exception.
+     if (record.ExceptionRecord) {
+       m_next_exception.reset(new ExceptionRecord(
+           *reinterpret_cast<const MINIDUMP_EXCEPTION *>(record.ExceptionRecord),
+           thread_id));
+     }
++#endif
+   }
+ 
+   virtual ~ExceptionRecord() {}
+@@ -57,9 +68,11 @@ public:
+   DWORD
+   GetExceptionCode() const { return m_code; }
+   bool IsContinuable() const { return m_continuable; }
++#if 0
+   const ExceptionRecord *GetNextException() const {
+     return m_next_exception.get();
+   }
++#endif
+   lldb::addr_t GetExceptionAddress() const { return m_exception_addr; }
+ 
+   lldb::tid_t GetThreadID() const { return m_thread_id; }
+@@ -69,7 +82,9 @@ public:
+ private:
+   DWORD m_code;
+   bool m_continuable;
++#if 0
+   std::shared_ptr<ExceptionRecord> m_next_exception;
++#endif
+   lldb::addr_t m_exception_addr;
+   lldb::tid_t m_thread_id;
+   std::vector<ULONG_PTR> m_arguments;
+-- 
+2.36.1
+

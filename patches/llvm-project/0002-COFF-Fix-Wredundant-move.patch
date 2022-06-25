@@ -1,0 +1,25 @@
+From 216257fef702252222bdf6d3c475986308e14286 Mon Sep 17 00:00:00 2001
+From: Benjamin Kramer <benny.kra@googlemail.com>
+Date: Fri, 3 Jun 2022 17:39:08 +0200
+Subject: [PATCH 2/9] [COFF] Fix -Wredundant-move
+
+---
+ llvm/lib/Object/COFFObjectFile.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/llvm/lib/Object/COFFObjectFile.cpp b/llvm/lib/Object/COFFObjectFile.cpp
+index 77d306884700..3ef492d799c7 100644
+--- a/llvm/lib/Object/COFFObjectFile.cpp
++++ b/llvm/lib/Object/COFFObjectFile.cpp
+@@ -767,7 +767,7 @@ static Error ignoreStrippedErrors(Error E) {
+     consumeError(std::move(E));
+     return Error::success();
+   }
+-  return std::move(E);
++  return E;
+ }
+ 
+ Error COFFObjectFile::initialize() {
+-- 
+2.36.1
+

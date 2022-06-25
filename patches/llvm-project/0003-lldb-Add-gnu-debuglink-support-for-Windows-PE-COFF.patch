@@ -1,0 +1,693 @@
+From 1e7755b1e21b805fba9eb71ffcc71f71d5eaef0f Mon Sep 17 00:00:00 2001
+From: Alvin Wong <alvin@alvinhc.com>
+Date: Thu, 9 Jun 2022 11:44:49 +0300
+Subject: [PATCH 3/9] [lldb] Add gnu-debuglink support for Windows PE/COFF
+
+The specification of gnu-debuglink can be found at:
+https://sourceware.org/gdb/onlinedocs/gdb/Separate-Debug-Files.html
+
+The file CRC or the CRC value from the .gnu_debuglink section is now
+used to calculate the module UUID as a fallback, to allow verifying that
+the debug object does match the executable. Note that if a CodeView
+build id exists, it still takes precedence. This works even for MinGW
+builds because LLD writes a synthetic CodeView build id which does not
+get stripped from the debug object.
+
+The `Minidump/Windows/find-module` test also needs a fix by adding a
+CodeView record to the exe to match the one in the minidump, otherwise
+it fails due to the new UUID calculated from the file CRC.
+
+Fixes https://github.com/llvm/llvm-project/issues/54344
+
+Reviewed By: DavidSpickett
+
+Differential Revision: https://reviews.llvm.org/D126367
+
+(cherry picked from commit c8daf4a707ad502b9694461246114bba01af5222)
+---
+ .../ObjectFile/PECOFF/ObjectFilePECOFF.cpp    |  62 +++++++-
+ .../ObjectFile/PECOFF/ObjectFilePECOFF.h      |   4 +
+ .../Plugins/SymbolVendor/CMakeLists.txt       |   1 +
+ .../SymbolVendor/PECOFF/CMakeLists.txt        |   9 ++
+ .../PECOFF/SymbolVendorPECOFF.cpp             | 137 ++++++++++++++++++
+ .../SymbolVendor/PECOFF/SymbolVendorPECOFF.h  |  37 +++++
+ lldb/source/Symbol/LocateSymbolFile.cpp       |  36 +++--
+ .../Windows/Inputs/find-module.exe.yaml       |   8 +
+ .../PECOFF/dwarf-gnu-debuglink-i686.yaml      |  55 +++++++
+ .../dwarf-gnu-debuglink-mismatched-crc.yaml   |  52 +++++++
+ .../dwarf-gnu-debuglink-pdb-buildid.yaml      |  63 ++++++++
+ .../PECOFF/dwarf-gnu-debuglink.yaml           |  50 +++++++
+ 12 files changed, 503 insertions(+), 11 deletions(-)
+ create mode 100644 lldb/source/Plugins/SymbolVendor/PECOFF/CMakeLists.txt
+ create mode 100644 lldb/source/Plugins/SymbolVendor/PECOFF/SymbolVendorPECOFF.cpp
+ create mode 100644 lldb/source/Plugins/SymbolVendor/PECOFF/SymbolVendorPECOFF.h
+ create mode 100644 lldb/test/Shell/ObjectFile/PECOFF/dwarf-gnu-debuglink-i686.yaml
+ create mode 100644 lldb/test/Shell/ObjectFile/PECOFF/dwarf-gnu-debuglink-mismatched-crc.yaml
+ create mode 100644 lldb/test/Shell/ObjectFile/PECOFF/dwarf-gnu-debuglink-pdb-buildid.yaml
+ create mode 100644 lldb/test/Shell/ObjectFile/PECOFF/dwarf-gnu-debuglink.yaml
+
+diff --git a/lldb/source/Plugins/ObjectFile/PECOFF/ObjectFilePECOFF.cpp b/lldb/source/Plugins/ObjectFile/PECOFF/ObjectFilePECOFF.cpp
+index f69f3c300ae7..dea474b8ac25 100644
+--- a/lldb/source/Plugins/ObjectFile/PECOFF/ObjectFilePECOFF.cpp
++++ b/lldb/source/Plugins/ObjectFile/PECOFF/ObjectFilePECOFF.cpp
+@@ -30,6 +30,7 @@
+ #include "llvm/BinaryFormat/COFF.h"
+ 
+ #include "llvm/Object/COFFImportFile.h"
++#include "llvm/Support/CRC.h"
+ #include "llvm/Support/Error.h"
+ #include "llvm/Support/MemoryBuffer.h"
+ 
+@@ -43,10 +44,42 @@ using namespace lldb_private;
+ 
+ LLDB_PLUGIN_DEFINE(ObjectFilePECOFF)
+ 
++static bool GetDebugLinkContents(const llvm::object::COFFObjectFile &coff_obj,
++                                 std::string &gnu_debuglink_file,
++                                 uint32_t &gnu_debuglink_crc) {
++  static ConstString g_sect_name_gnu_debuglink(".gnu_debuglink");
++  for (const auto &section : coff_obj.sections()) {
++    auto name = section.getName();
++    if (!name) {
++      llvm::consumeError(name.takeError());
++      continue;
++    }
++    if (*name == g_sect_name_gnu_debuglink.GetStringRef()) {
++      auto content = section.getContents();
++      if (!content) {
++        llvm::consumeError(content.takeError());
++        return false;
++      }
++      DataExtractor data(
++          content->data(), content->size(),
++          coff_obj.isLittleEndian() ? eByteOrderLittle : eByteOrderBig, 4);
++      lldb::offset_t gnu_debuglink_offset = 0;
++      gnu_debuglink_file = data.GetCStr(&gnu_debuglink_offset);
++      // Align to the next 4-byte offset
++      gnu_debuglink_offset = llvm::alignTo(gnu_debuglink_offset, 4);
++      data.GetU32(&gnu_debuglink_offset, &gnu_debuglink_crc, 1);
++      return true;
++    }
++  }
++  return false;
++}
++
+ static UUID GetCoffUUID(llvm::object::COFFObjectFile &coff_obj) {
+   const llvm::codeview::DebugInfo *pdb_info = nullptr;
+   llvm::StringRef pdb_file;
+ 
++  // First, prefer to use the PDB build id. LLD generates this even for mingw
++  // targets without PDB output, and it does not get stripped either.
+   if (!coff_obj.getDebugPDBInfo(pdb_info, pdb_file) && pdb_info) {
+     if (pdb_info->PDB70.CVSignature == llvm::OMF::Signature::PDB70) {
+       UUID::CvRecordPdb70 info;
+@@ -56,7 +89,26 @@ static UUID GetCoffUUID(llvm::object::COFFObjectFile &coff_obj) {
+     }
+   }
+ 
+-  return UUID();
++  std::string gnu_debuglink_file;
++  uint32_t gnu_debuglink_crc;
++
++  // The GNU linker normally does not write a PDB build id (unless requested
++  // with the --build-id option), so we should fall back to using the crc
++  // from .gnu_debuglink if it exists, just like how ObjectFileELF does it.
++  if (!GetDebugLinkContents(coff_obj, gnu_debuglink_file, gnu_debuglink_crc)) {
++    // If there is no .gnu_debuglink section, then this may be an object
++    // containing DWARF debug info for .gnu_debuglink, so calculate the crc of
++    // the object itself.
++    auto raw_data = coff_obj.getData();
++    LLDB_SCOPED_TIMERF(
++        "Calculating module crc32 %s with size %" PRIu64 " KiB",
++        FileSpec(coff_obj.getFileName()).GetLastPathComponent().AsCString(),
++        static_cast<lldb::offset_t>(raw_data.size()) / 1024);
++    gnu_debuglink_crc = llvm::crc32(0, llvm::arrayRefFromStringRef(raw_data));
++  }
++  // Use 4 bytes of crc from the .gnu_debuglink section.
++  llvm::support::ulittle32_t data(gnu_debuglink_crc);
++  return UUID::fromData(&data, sizeof(data));
+ }
+ 
+ char ObjectFilePECOFF::ID;
+@@ -871,6 +923,14 @@ UUID ObjectFilePECOFF::GetUUID() {
+   return m_uuid;
+ }
+ 
++llvm::Optional<FileSpec> ObjectFilePECOFF::GetDebugLink() {
++  std::string gnu_debuglink_file;
++  uint32_t gnu_debuglink_crc;
++  if (GetDebugLinkContents(*m_binary, gnu_debuglink_file, gnu_debuglink_crc))
++    return FileSpec(gnu_debuglink_file);
++  return llvm::None;
++}
++
+ uint32_t ObjectFilePECOFF::ParseDependentModules() {
+   ModuleSP module_sp(GetModule());
+   if (!module_sp)
+diff --git a/lldb/source/Plugins/ObjectFile/PECOFF/ObjectFilePECOFF.h b/lldb/source/Plugins/ObjectFile/PECOFF/ObjectFilePECOFF.h
+index b7de24d1d418..a208fe6d1c65 100644
+--- a/lldb/source/Plugins/ObjectFile/PECOFF/ObjectFilePECOFF.h
++++ b/lldb/source/Plugins/ObjectFile/PECOFF/ObjectFilePECOFF.h
+@@ -119,6 +119,10 @@ public:
+ 
+   lldb_private::UUID GetUUID() override;
+ 
++  /// Return the contents of the .gnu_debuglink section, if the object file
++  /// contains it.
++  llvm::Optional<lldb_private::FileSpec> GetDebugLink();
++
+   uint32_t GetDependentModules(lldb_private::FileSpecList &files) override;
+ 
+   lldb_private::Address GetEntryPointAddress() override;
+diff --git a/lldb/source/Plugins/SymbolVendor/CMakeLists.txt b/lldb/source/Plugins/SymbolVendor/CMakeLists.txt
+index 3e1b24b49835..1981706e06f4 100644
+--- a/lldb/source/Plugins/SymbolVendor/CMakeLists.txt
++++ b/lldb/source/Plugins/SymbolVendor/CMakeLists.txt
+@@ -4,4 +4,5 @@ if (CMAKE_SYSTEM_NAME MATCHES "Darwin")
+   add_subdirectory(MacOSX)
+ endif()
+ 
++add_subdirectory(PECOFF)
+ add_subdirectory(wasm)
+diff --git a/lldb/source/Plugins/SymbolVendor/PECOFF/CMakeLists.txt b/lldb/source/Plugins/SymbolVendor/PECOFF/CMakeLists.txt
+new file mode 100644
+index 000000000000..d78366508b09
+--- /dev/null
++++ b/lldb/source/Plugins/SymbolVendor/PECOFF/CMakeLists.txt
+@@ -0,0 +1,9 @@
++add_lldb_library(lldbPluginSymbolVendorPECOFF PLUGIN
++  SymbolVendorPECOFF.cpp
++
++  LINK_LIBS
++    lldbCore
++    lldbHost
++    lldbSymbol
++    lldbPluginObjectFilePECOFF
++  )
+diff --git a/lldb/source/Plugins/SymbolVendor/PECOFF/SymbolVendorPECOFF.cpp b/lldb/source/Plugins/SymbolVendor/PECOFF/SymbolVendorPECOFF.cpp
+new file mode 100644
+index 000000000000..e08753b86d5b
+--- /dev/null
++++ b/lldb/source/Plugins/SymbolVendor/PECOFF/SymbolVendorPECOFF.cpp
+@@ -0,0 +1,137 @@
++//===-- SymbolVendorPECOFF.cpp --------------------------------------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include "SymbolVendorPECOFF.h"
++
++#include <cstring>
++
++#include "Plugins/ObjectFile/PECOFF/ObjectFilePECOFF.h"
++#include "lldb/Core/Module.h"
++#include "lldb/Core/ModuleSpec.h"
++#include "lldb/Core/PluginManager.h"
++#include "lldb/Core/Section.h"
++#include "lldb/Host/Host.h"
++#include "lldb/Symbol/LocateSymbolFile.h"
++#include "lldb/Symbol/ObjectFile.h"
++#include "lldb/Target/Target.h"
++#include "lldb/Utility/StreamString.h"
++#include "lldb/Utility/Timer.h"
++
++using namespace lldb;
++using namespace lldb_private;
++
++LLDB_PLUGIN_DEFINE(SymbolVendorPECOFF)
++
++// SymbolVendorPECOFF constructor
++SymbolVendorPECOFF::SymbolVendorPECOFF(const lldb::ModuleSP &module_sp)
++    : SymbolVendor(module_sp) {}
++
++void SymbolVendorPECOFF::Initialize() {
++  PluginManager::RegisterPlugin(GetPluginNameStatic(),
++                                GetPluginDescriptionStatic(), CreateInstance);
++}
++
++void SymbolVendorPECOFF::Terminate() {
++  PluginManager::UnregisterPlugin(CreateInstance);
++}
++
++llvm::StringRef SymbolVendorPECOFF::GetPluginDescriptionStatic() {
++  return "Symbol vendor for PE/COFF that looks for dSYM files that match "
++         "executables.";
++}
++
++// CreateInstance
++//
++// Platforms can register a callback to use when creating symbol vendors to
++// allow for complex debug information file setups, and to also allow for
++// finding separate debug information files.
++SymbolVendor *
++SymbolVendorPECOFF::CreateInstance(const lldb::ModuleSP &module_sp,
++                                   lldb_private::Stream *feedback_strm) {
++  if (!module_sp)
++    return nullptr;
++
++  ObjectFilePECOFF *obj_file =
++      llvm::dyn_cast_or_null<ObjectFilePECOFF>(module_sp->GetObjectFile());
++  if (!obj_file)
++    return nullptr;
++
++  lldb_private::UUID uuid = obj_file->GetUUID();
++  if (!uuid)
++    return nullptr;
++
++  // If the main object file already contains debug info, then we are done.
++  if (obj_file->GetSectionList()->FindSectionByType(
++          lldb::eSectionTypeDWARFDebugInfo, true))
++    return nullptr;
++
++  // If the module specified a filespec, use that.
++  FileSpec fspec = module_sp->GetSymbolFileFileSpec();
++  // Otherwise, try gnu_debuglink, if one exists.
++  if (!fspec)
++    fspec = obj_file->GetDebugLink().getValueOr(FileSpec());
++
++  LLDB_SCOPED_TIMERF("SymbolVendorPECOFF::CreateInstance (module = %s)",
++                     module_sp->GetFileSpec().GetPath().c_str());
++
++  ModuleSpec module_spec;
++
++  module_spec.GetFileSpec() = obj_file->GetFileSpec();
++  FileSystem::Instance().Resolve(module_spec.GetFileSpec());
++  module_spec.GetSymbolFileSpec() = fspec;
++  module_spec.GetUUID() = uuid;
++  FileSpecList search_paths = Target::GetDefaultDebugFileSearchPaths();
++  FileSpec dsym_fspec =
++      Symbols::LocateExecutableSymbolFile(module_spec, search_paths);
++  if (!dsym_fspec)
++    return nullptr;
++
++  DataBufferSP dsym_file_data_sp;
++  lldb::offset_t dsym_file_data_offset = 0;
++  ObjectFileSP dsym_objfile_sp = ObjectFile::FindPlugin(
++      module_sp, &dsym_fspec, 0, FileSystem::Instance().GetByteSize(dsym_fspec),
++      dsym_file_data_sp, dsym_file_data_offset);
++  if (!dsym_objfile_sp)
++    return nullptr;
++
++  // This objfile is for debugging purposes.
++  dsym_objfile_sp->SetType(ObjectFile::eTypeDebugInfo);
++
++  SymbolVendorPECOFF *symbol_vendor = new SymbolVendorPECOFF(module_sp);
++
++  // Get the module unified section list and add our debug sections to
++  // that.
++  SectionList *module_section_list = module_sp->GetSectionList();
++  SectionList *objfile_section_list = dsym_objfile_sp->GetSectionList();
++  if (!objfile_section_list || !module_section_list)
++    return nullptr;
++
++  static const SectionType g_sections[] = {
++      eSectionTypeDWARFDebugAbbrev,   eSectionTypeDWARFDebugAranges,
++      eSectionTypeDWARFDebugFrame,    eSectionTypeDWARFDebugInfo,
++      eSectionTypeDWARFDebugLine,     eSectionTypeDWARFDebugLoc,
++      eSectionTypeDWARFDebugLocLists, eSectionTypeDWARFDebugMacInfo,
++      eSectionTypeDWARFDebugNames,    eSectionTypeDWARFDebugPubNames,
++      eSectionTypeDWARFDebugPubTypes, eSectionTypeDWARFDebugRanges,
++      eSectionTypeDWARFDebugStr,      eSectionTypeDWARFDebugTypes,
++  };
++  for (SectionType section_type : g_sections) {
++    if (SectionSP section_sp =
++            objfile_section_list->FindSectionByType(section_type, true)) {
++      if (SectionSP module_section_sp =
++              module_section_list->FindSectionByType(section_type, true))
++        module_section_list->ReplaceSection(module_section_sp->GetID(),
++                                            section_sp);
++      else
++        module_section_list->AddSection(section_sp);
++    }
++  }
++
++  symbol_vendor->AddSymbolFileRepresentation(dsym_objfile_sp);
++  return symbol_vendor;
++}
+diff --git a/lldb/source/Plugins/SymbolVendor/PECOFF/SymbolVendorPECOFF.h b/lldb/source/Plugins/SymbolVendor/PECOFF/SymbolVendorPECOFF.h
+new file mode 100644
+index 000000000000..ff77ca5faac8
+--- /dev/null
++++ b/lldb/source/Plugins/SymbolVendor/PECOFF/SymbolVendorPECOFF.h
+@@ -0,0 +1,37 @@
++//===-- SymbolVendorPECOFF.h ------------------------------------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLDB_SOURCE_PLUGINS_SYMBOLVENDOR_PECOFF_SYMBOLVENDORPECOFF_H
++#define LLDB_SOURCE_PLUGINS_SYMBOLVENDOR_PECOFF_SYMBOLVENDORPECOFF_H
++
++#include "lldb/Symbol/SymbolVendor.h"
++#include "lldb/lldb-private.h"
++
++class SymbolVendorPECOFF : public lldb_private::SymbolVendor {
++public:
++  // Constructors and Destructors
++  SymbolVendorPECOFF(const lldb::ModuleSP &module_sp);
++
++  // Static Functions
++  static void Initialize();
++
++  static void Terminate();
++
++  static llvm::StringRef GetPluginNameStatic() { return "PE-COFF"; }
++
++  static llvm::StringRef GetPluginDescriptionStatic();
++
++  static lldb_private::SymbolVendor *
++  CreateInstance(const lldb::ModuleSP &module_sp,
++                 lldb_private::Stream *feedback_strm);
++
++  // PluginInterface protocol
++  llvm::StringRef GetPluginName() override { return GetPluginNameStatic(); }
++};
++
++#endif // LLDB_SOURCE_PLUGINS_SYMBOLVENDOR_PECOFF_SYMBOLVENDORPECOFF_H
+diff --git a/lldb/source/Symbol/LocateSymbolFile.cpp b/lldb/source/Symbol/LocateSymbolFile.cpp
+index ba79bf661cd3..7580ebcdb4ad 100644
+--- a/lldb/source/Symbol/LocateSymbolFile.cpp
++++ b/lldb/source/Symbol/LocateSymbolFile.cpp
+@@ -355,18 +355,34 @@ Symbols::LocateExecutableSymbolFile(const ModuleSpec &module_spec,
+         lldb_private::ModuleSpecList specs;
+         const size_t num_specs =
+             ObjectFile::GetModuleSpecifications(file_spec, 0, 0, specs);
+-        assert(num_specs <= 1 &&
+-               "Symbol Vendor supports only a single architecture");
+-        if (num_specs == 1) {
+-          ModuleSpec mspec;
+-          if (specs.GetModuleSpecAtIndex(0, mspec)) {
+-            // Skip the uuids check if module_uuid is invalid. For example,
+-            // this happens for *.dwp files since at the moment llvm-dwp
+-            // doesn't output build ids, nor does binutils dwp.
+-            if (!module_uuid.IsValid() || module_uuid == mspec.GetUUID())
+-              return file_spec;
++        ModuleSpec mspec;
++        bool valid_mspec = false;
++        if (num_specs == 2) {
++          // Special case to handle both i386 and i686 from ObjectFilePECOFF
++          ModuleSpec mspec2;
++          if (specs.GetModuleSpecAtIndex(0, mspec) &&
++              specs.GetModuleSpecAtIndex(1, mspec2) &&
++              mspec.GetArchitecture().GetTriple().isCompatibleWith(
++                  mspec2.GetArchitecture().GetTriple())) {
++            valid_mspec = true;
+           }
+         }
++        if (!valid_mspec) {
++          assert(num_specs <= 1 &&
++                 "Symbol Vendor supports only a single architecture");
++          if (num_specs == 1) {
++            if (specs.GetModuleSpecAtIndex(0, mspec)) {
++              valid_mspec = true;
++            }
++          }
++        }
++        if (valid_mspec) {
++          // Skip the uuids check if module_uuid is invalid. For example,
++          // this happens for *.dwp files since at the moment llvm-dwp
++          // doesn't output build ids, nor does binutils dwp.
++          if (!module_uuid.IsValid() || module_uuid == mspec.GetUUID())
++            return file_spec;
++        }
+       }
+     }
+   }
+diff --git a/lldb/test/Shell/Minidump/Windows/Inputs/find-module.exe.yaml b/lldb/test/Shell/Minidump/Windows/Inputs/find-module.exe.yaml
+index 42ccc6d6e053..c4e2b931c4a3 100644
+--- a/lldb/test/Shell/Minidump/Windows/Inputs/find-module.exe.yaml
++++ b/lldb/test/Shell/Minidump/Windows/Inputs/find-module.exe.yaml
+@@ -16,6 +16,9 @@ OptionalHeader:
+   SizeOfStackCommit: 4096
+   SizeOfHeapReserve: 1048576
+   SizeOfHeapCommit: 4096
++  Debug:
++    RelativeVirtualAddress: 20480
++    Size:            28
+ header:
+   Machine:         IMAGE_FILE_MACHINE_I386
+   Characteristics: [ IMAGE_FILE_EXECUTABLE_IMAGE, IMAGE_FILE_32BIT_MACHINE ]
+@@ -28,5 +31,10 @@ sections:
+     Characteristics: [ IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_MEM_DISCARDABLE, IMAGE_SCN_MEM_READ ]
+     VirtualAddress:  16384
+     VirtualSize:     48
++  - Name:            .buildid
++    Characteristics: [ IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_MEM_READ ]
++    VirtualAddress:  20480
++    VirtualSize:     194
++    SectionData:     00000000E5038E620000000002000000A60000001C5000001C400000525344533ED87D89C8A8184197F3A925EE4BF74101000000433A5C70726F6A656374735C746573745F6170705C436F6E736F6C654170706C69636174696F6E315C44656275675C436F6E736F6C654170706C69636174696F6E312E70646200
+ symbols:         []
+ ...
+diff --git a/lldb/test/Shell/ObjectFile/PECOFF/dwarf-gnu-debuglink-i686.yaml b/lldb/test/Shell/ObjectFile/PECOFF/dwarf-gnu-debuglink-i686.yaml
+new file mode 100644
+index 000000000000..a28a4f396d68
+--- /dev/null
++++ b/lldb/test/Shell/ObjectFile/PECOFF/dwarf-gnu-debuglink-i686.yaml
+@@ -0,0 +1,55 @@
++# This test produces a stripped version of the object file and adds a
++# gnu-debuglink section to it linking to the unstripped version of the object
++# file. The debug info shall be loaded from the gnu-debuglink reference.
++#
++# This test is added to check that Symbols::LocateExecutableSymbolFile (in
++# LocateSymbolFile.cpp) can handle ObjectFilePECOFF::GetModuleSpecifications
++# returning two different module specs for MachineX86 -- "i386-pc-windows" and
++# "i686-pc-windows".
++
++# RUN: yaml2obj %s -o %t
++# RUN: llvm-objcopy --strip-all --add-gnu-debuglink=%t %t %t.stripped
++# RUN: lldb-test object-file %t.stripped | FileCheck %s
++
++# CHECK: Name: .debug_info
++# CHECK-NEXT: Type: dwarf-info
++
++--- !COFF
++OptionalHeader:
++  AddressOfEntryPoint: 4480
++  ImageBase:       268435456
++  SectionAlignment: 4096
++  FileAlignment:   512
++  MajorOperatingSystemVersion: 6
++  MinorOperatingSystemVersion: 0
++  MajorImageVersion: 0
++  MinorImageVersion: 0
++  MajorSubsystemVersion: 6
++  MinorSubsystemVersion: 0
++  Subsystem:       IMAGE_SUBSYSTEM_WINDOWS_CUI
++  DLLCharacteristics: [ IMAGE_DLL_CHARACTERISTICS_DYNAMIC_BASE, IMAGE_DLL_CHARACTERISTICS_NX_COMPAT, IMAGE_DLL_CHARACTERISTICS_TERMINAL_SERVER_AWARE ]
++  SizeOfStackReserve: 1048576
++  SizeOfStackCommit: 4096
++  SizeOfHeapReserve: 1048576
++  SizeOfHeapCommit: 4096
++header:
++  Machine:         IMAGE_FILE_MACHINE_I386
++  Characteristics: [ IMAGE_FILE_EXECUTABLE_IMAGE, IMAGE_FILE_32BIT_MACHINE ]
++sections:
++  - Name:            .text
++    Characteristics: [ IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ ]
++    VirtualAddress:  4096
++    VirtualSize:     64
++    SectionData:     DEADBEEFBAADF00D
++  - Name:            .data
++    Characteristics: [ IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_MEM_READ ]
++    VirtualAddress:  8192
++    VirtualSize:     64
++    SectionData:     DEADBEEFBAADF00D
++  - Name:            .debug_info
++    Characteristics: [ IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_MEM_DISCARDABLE, IMAGE_SCN_MEM_READ ]
++    VirtualAddress:  16384
++    VirtualSize:     64
++    SectionData:     DEADBEEFBAADF00D
++symbols:         []
++...
+diff --git a/lldb/test/Shell/ObjectFile/PECOFF/dwarf-gnu-debuglink-mismatched-crc.yaml b/lldb/test/Shell/ObjectFile/PECOFF/dwarf-gnu-debuglink-mismatched-crc.yaml
+new file mode 100644
+index 000000000000..5589bef147bd
+--- /dev/null
++++ b/lldb/test/Shell/ObjectFile/PECOFF/dwarf-gnu-debuglink-mismatched-crc.yaml
+@@ -0,0 +1,52 @@
++# This test produces a stripped version of the object file and adds a
++# gnu-debuglink section to it linking to the unstripped version of the object
++# file. Then the unstripped version is stripped to keep only debug info to
++# cause its crc to change. In this case the debug info shall not be loaded.
++
++# RUN: yaml2obj %s -o %t
++# RUN: llvm-objcopy --strip-all --add-gnu-debuglink=%t %t %t.stripped
++# RUN: llvm-strip --only-keep-debug %t
++# RUN: lldb-test object-file %t.stripped | FileCheck %s
++
++# CHECK-NOT: Name: .debug_info
++# CHECK-NOT: Type: dwarf-info
++
++--- !COFF
++OptionalHeader:
++  AddressOfEntryPoint: 5152
++  ImageBase:       5368709120
++  SectionAlignment: 4096
++  FileAlignment:   512
++  MajorOperatingSystemVersion: 6
++  MinorOperatingSystemVersion: 0
++  MajorImageVersion: 0
++  MinorImageVersion: 0
++  MajorSubsystemVersion: 6
++  MinorSubsystemVersion: 0
++  Subsystem:       IMAGE_SUBSYSTEM_WINDOWS_CUI
++  DLLCharacteristics: [ IMAGE_DLL_CHARACTERISTICS_HIGH_ENTROPY_VA, IMAGE_DLL_CHARACTERISTICS_DYNAMIC_BASE, IMAGE_DLL_CHARACTERISTICS_NX_COMPAT, IMAGE_DLL_CHARACTERISTICS_TERMINAL_SERVER_AWARE ]
++  SizeOfStackReserve: 1048576
++  SizeOfStackCommit: 4096
++  SizeOfHeapReserve: 1048576
++  SizeOfHeapCommit: 4096
++header:
++  Machine:         IMAGE_FILE_MACHINE_AMD64
++  Characteristics: [ IMAGE_FILE_EXECUTABLE_IMAGE, IMAGE_FILE_LARGE_ADDRESS_AWARE ]
++sections:
++  - Name:            .text
++    Characteristics: [ IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ ]
++    VirtualAddress:  4096
++    VirtualSize:     64
++    SectionData:     DEADBEEFBAADF00D
++  - Name:            .data
++    Characteristics: [ IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_MEM_READ ]
++    VirtualAddress:  8192
++    VirtualSize:     64
++    SectionData:     DEADBEEFBAADF00D
++  - Name:            .debug_info
++    Characteristics: [ IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_MEM_DISCARDABLE, IMAGE_SCN_MEM_READ ]
++    VirtualAddress:  16384
++    VirtualSize:     64
++    SectionData:     DEADBEEFBAADF00D
++symbols:         []
++...
+diff --git a/lldb/test/Shell/ObjectFile/PECOFF/dwarf-gnu-debuglink-pdb-buildid.yaml b/lldb/test/Shell/ObjectFile/PECOFF/dwarf-gnu-debuglink-pdb-buildid.yaml
+new file mode 100644
+index 000000000000..aceac7094113
+--- /dev/null
++++ b/lldb/test/Shell/ObjectFile/PECOFF/dwarf-gnu-debuglink-pdb-buildid.yaml
+@@ -0,0 +1,63 @@
++# This test produces a stripped version of the object file and adds a
++# gnu-debuglink section to it linking to the unstripped version of the object
++# file. Then the unstripped version is stripped to keep only debug info to
++# cause its crc to change. In this case the object files still have the
++# synthetic PDB build id that LLD adds even for the mingw target. Because this
++# build id still matches, the debug info shall still be loaded from the
++# gnu-debuglink reference.
++
++# RUN: yaml2obj %s -o %t
++# RUN: llvm-objcopy --strip-all --add-gnu-debuglink=%t %t %t.stripped
++# RUN: llvm-strip --only-keep-debug %t
++# RUN: lldb-test object-file %t.stripped | FileCheck %s
++
++# CHECK: Name: .debug_info
++# CHECK-NEXT: Type: dwarf-info
++
++--- !COFF
++OptionalHeader:
++  AddressOfEntryPoint: 5152
++  ImageBase:       5368709120
++  SectionAlignment: 4096
++  FileAlignment:   512
++  MajorOperatingSystemVersion: 6
++  MinorOperatingSystemVersion: 0
++  MajorImageVersion: 0
++  MinorImageVersion: 0
++  MajorSubsystemVersion: 6
++  MinorSubsystemVersion: 0
++  Subsystem:       IMAGE_SUBSYSTEM_WINDOWS_CUI
++  DLLCharacteristics: [ IMAGE_DLL_CHARACTERISTICS_HIGH_ENTROPY_VA, IMAGE_DLL_CHARACTERISTICS_DYNAMIC_BASE, IMAGE_DLL_CHARACTERISTICS_NX_COMPAT, IMAGE_DLL_CHARACTERISTICS_TERMINAL_SERVER_AWARE ]
++  SizeOfStackReserve: 1048576
++  SizeOfStackCommit: 4096
++  SizeOfHeapReserve: 1048576
++  SizeOfHeapCommit: 4096
++  Debug:
++    RelativeVirtualAddress: 16384
++    Size:            28
++header:
++  Machine:         IMAGE_FILE_MACHINE_AMD64
++  Characteristics: [ IMAGE_FILE_EXECUTABLE_IMAGE, IMAGE_FILE_LARGE_ADDRESS_AWARE ]
++sections:
++  - Name:            .text
++    Characteristics: [ IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ ]
++    VirtualAddress:  4096
++    VirtualSize:     64
++    SectionData:     DEADBEEFBAADF00D
++  - Name:            .data
++    Characteristics: [ IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_MEM_READ ]
++    VirtualAddress:  8192
++    VirtualSize:     64
++    SectionData:     DEADBEEFBAADF00D
++  - Name:            .buildid
++    Characteristics: [ IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_MEM_READ ]
++    VirtualAddress:  16384
++    VirtualSize:     53
++    SectionData:     00000000E5038E620000000002000000190000001C4000001C300000525344534674A52A37FB4C784C4C44205044422E0100000000
++  - Name:            .debug_info
++    Characteristics: [ IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_MEM_DISCARDABLE, IMAGE_SCN_MEM_READ ]
++    VirtualAddress:  20480
++    VirtualSize:     64
++    SectionData:     DEADBEEFBAADF00D
++symbols:         []
++...
+diff --git a/lldb/test/Shell/ObjectFile/PECOFF/dwarf-gnu-debuglink.yaml b/lldb/test/Shell/ObjectFile/PECOFF/dwarf-gnu-debuglink.yaml
+new file mode 100644
+index 000000000000..9bd678823b80
+--- /dev/null
++++ b/lldb/test/Shell/ObjectFile/PECOFF/dwarf-gnu-debuglink.yaml
+@@ -0,0 +1,50 @@
++# This test produces a stripped version of the object file and adds a
++# gnu-debuglink section to it linking to the unstripped version of the object
++# file. The debug info shall be loaded from the gnu-debuglink reference.
++
++# RUN: yaml2obj %s -o %t
++# RUN: llvm-objcopy --strip-all --add-gnu-debuglink=%t %t %t.stripped
++# RUN: lldb-test object-file %t.stripped | FileCheck %s
++
++# CHECK: Name: .debug_info
++# CHECK-NEXT: Type: dwarf-info
++
++--- !COFF
++OptionalHeader:
++  AddressOfEntryPoint: 5152
++  ImageBase:       5368709120
++  SectionAlignment: 4096
++  FileAlignment:   512
++  MajorOperatingSystemVersion: 6
++  MinorOperatingSystemVersion: 0
++  MajorImageVersion: 0
++  MinorImageVersion: 0
++  MajorSubsystemVersion: 6
++  MinorSubsystemVersion: 0
++  Subsystem:       IMAGE_SUBSYSTEM_WINDOWS_CUI
++  DLLCharacteristics: [ IMAGE_DLL_CHARACTERISTICS_HIGH_ENTROPY_VA, IMAGE_DLL_CHARACTERISTICS_DYNAMIC_BASE, IMAGE_DLL_CHARACTERISTICS_NX_COMPAT, IMAGE_DLL_CHARACTERISTICS_TERMINAL_SERVER_AWARE ]
++  SizeOfStackReserve: 1048576
++  SizeOfStackCommit: 4096
++  SizeOfHeapReserve: 1048576
++  SizeOfHeapCommit: 4096
++header:
++  Machine:         IMAGE_FILE_MACHINE_AMD64
++  Characteristics: [ IMAGE_FILE_EXECUTABLE_IMAGE, IMAGE_FILE_LARGE_ADDRESS_AWARE ]
++sections:
++  - Name:            .text
++    Characteristics: [ IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ ]
++    VirtualAddress:  4096
++    VirtualSize:     64
++    SectionData:     DEADBEEFBAADF00D
++  - Name:            .data
++    Characteristics: [ IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_MEM_READ ]
++    VirtualAddress:  8192
++    VirtualSize:     64
++    SectionData:     DEADBEEFBAADF00D
++  - Name:            .debug_info
++    Characteristics: [ IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_MEM_DISCARDABLE, IMAGE_SCN_MEM_READ ]
++    VirtualAddress:  16384
++    VirtualSize:     64
++    SectionData:     DEADBEEFBAADF00D
++symbols:         []
++...
+-- 
+2.36.1
+

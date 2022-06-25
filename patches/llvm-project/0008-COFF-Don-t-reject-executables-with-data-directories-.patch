@@ -1,0 +1,177 @@
+From 0c55924a7834bdd7121ae80e258201a6dfc5feab Mon Sep 17 00:00:00 2001
+From: Martin Storsj <martin@martin.st>
+Date: Fri, 10 Jun 2022 23:09:11 +0800
+Subject: [PATCH 8/9] [COFF] Don't reject executables with data directories
+ pointing outside of provided data
+
+Before bb94611d6545c2c5271f5bb01de1aa4228a37250, we didn't check
+that the sections in the COFF executable actually contained enough
+raw data, when looking up what section contains tables pointed to
+by the data directories.
+
+That commit added checking, to avoid setting a pointer that points
+out of bounds - by rejecting such executables.
+
+It turns out that some binaries (e.g.g a "helper.exe" provided by
+NSIS) contains a base relocation table data directory that points
+into the wrong section. It points inside the virtual address space
+allocated for that section, but the section contains much less raw
+data, and the table points outside of the provided raw data.
+
+No longer reject such binaries (to let tools operate on them and
+inspect them), but don't set the table pointers (so that when
+printing e.g. base relocations, we don't print anything).
+
+This should fix the regression pointed out in
+https://reviews.llvm.org/D126898#3565834.
+
+Differential Revision: https://reviews.llvm.org/D127345
+---
+ llvm/lib/Object/COFFObjectFile.cpp            | 14 +--
+ .../Inputs/COFF/data-dir-out-of-bounds.yaml   | 89 +++++++++++++++++++
+ .../Object/coff-data-dir-out-of-bounds.test   | 10 +++
+ 3 files changed, 103 insertions(+), 10 deletions(-)
+ create mode 100644 llvm/test/Object/Inputs/COFF/data-dir-out-of-bounds.yaml
+ create mode 100644 llvm/test/Object/coff-data-dir-out-of-bounds.test
+
+diff --git a/llvm/lib/Object/COFFObjectFile.cpp b/llvm/lib/Object/COFFObjectFile.cpp
+index 3ef492d799c7..339853e10c38 100644
+--- a/llvm/lib/Object/COFFObjectFile.cpp
++++ b/llvm/lib/Object/COFFObjectFile.cpp
+@@ -481,18 +481,12 @@ Error COFFObjectFile::getRvaPtr(uint32_t Addr, uintptr_t &Res) const {
+       // fail, otherwise it will be impossible to use this object as debug info
+       // in LLDB. Return SectionStrippedError here so that
+       // COFFObjectFile::initialize can ignore the error.
+-      if (Section->SizeOfRawData == 0)
+-        return make_error<SectionStrippedError>();
++      // Somewhat common binaries may have RVAs pointing outside of the
++      // provided raw data. Instead of rejecting the binaries, just
++      // treat the section as stripped for these purposes.
+       if (Section->SizeOfRawData < Section->VirtualSize &&
+           Addr >= SectionStart + Section->SizeOfRawData) {
+-        if (ErrorContext)
+-          return createStringError(object_error::parse_failed,
+-                                   "RVA 0x%" PRIx32
+-                                   " for %s found but data is incomplete",
+-                                   Addr, ErrorContext);
+-        return createStringError(
+-            object_error::parse_failed,
+-            "RVA 0x%" PRIx32 " found but data is incomplete", Addr);
++        return make_error<SectionStrippedError>();
+       }
+       uint32_t Offset = Addr - SectionStart;
+       Res = reinterpret_cast<uintptr_t>(base()) + Section->PointerToRawData +
+diff --git a/llvm/test/Object/Inputs/COFF/data-dir-out-of-bounds.yaml b/llvm/test/Object/Inputs/COFF/data-dir-out-of-bounds.yaml
+new file mode 100644
+index 000000000000..f2a97d7cfe22
+--- /dev/null
++++ b/llvm/test/Object/Inputs/COFF/data-dir-out-of-bounds.yaml
+@@ -0,0 +1,89 @@
++--- !COFF
++OptionalHeader:  
++  AddressOfEntryPoint: 4144
++  ImageBase:       1073741824
++  SectionAlignment: 4096
++  FileAlignment:   512
++  MajorOperatingSystemVersion: 6
++  MinorOperatingSystemVersion: 0
++  MajorImageVersion: 0
++  MinorImageVersion: 0
++  MajorSubsystemVersion: 6
++  MinorSubsystemVersion: 0
++  Subsystem:       IMAGE_SUBSYSTEM_WINDOWS_CUI
++  DLLCharacteristics: [ IMAGE_DLL_CHARACTERISTICS_HIGH_ENTROPY_VA, IMAGE_DLL_CHARACTERISTICS_DYNAMIC_BASE, IMAGE_DLL_CHARACTERISTICS_NX_COMPAT, IMAGE_DLL_CHARACTERISTICS_TERMINAL_SERVER_AWARE ]
++  SizeOfStackReserve: 1048576
++  SizeOfStackCommit: 4096
++  SizeOfHeapReserve: 1048576
++  SizeOfHeapCommit: 4096
++  ExportTable:     
++    RelativeVirtualAddress: 0
++    Size:            0
++  ImportTable:     
++    RelativeVirtualAddress: 0
++    Size:            0
++  ResourceTable:   
++    RelativeVirtualAddress: 0
++    Size:            0
++  ExceptionTable:  
++    RelativeVirtualAddress: 0
++    Size:            0
++  CertificateTable: 
++    RelativeVirtualAddress: 0
++    Size:            0
++  BaseRelocationTable: 
++    RelativeVirtualAddress: 14288
++    Size:            32
++  Debug:           
++    RelativeVirtualAddress: 0
++    Size:            0
++  Architecture:    
++    RelativeVirtualAddress: 0
++    Size:            0
++  GlobalPtr:       
++    RelativeVirtualAddress: 0
++    Size:            0
++  TlsTable:        
++    RelativeVirtualAddress: 0
++    Size:            0
++  LoadConfigTable: 
++    RelativeVirtualAddress: 0
++    Size:            0
++  BoundImport:     
++    RelativeVirtualAddress: 0
++    Size:            0
++  IAT:             
++    RelativeVirtualAddress: 0
++    Size:            0
++  DelayImportDescriptor: 
++    RelativeVirtualAddress: 0
++    Size:            0
++  ClrRuntimeHeader: 
++    RelativeVirtualAddress: 0
++    Size:            0
++header:          
++  Machine:         IMAGE_FILE_MACHINE_AMD64
++  Characteristics: [ IMAGE_FILE_EXECUTABLE_IMAGE, IMAGE_FILE_LARGE_ADDRESS_AWARE ]
++sections:        
++  - Name:            .text
++    Characteristics: [ IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ ]
++    VirtualAddress:  4096
++    VirtualSize:     87
++    SectionData:     50894C24048B0DF51F0000034C240489C859C3662E0F1F8400000000000F1F00C3662E0F1F8400000000000F1F440000554883EC30488D6C2430E8E1FFFFFFC745FC00000000B902000000E8B0FFFFFF904883C4305DC3
++  - Name:            .rdata
++    Characteristics: [ IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_MEM_READ ]
++    VirtualAddress:  8192
++    VirtualSize:     20
++    SectionData:     0101010001020000010A03350A03055201500000
++  - Name:            .data
++    Characteristics: [ IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE ]
++    VirtualAddress:  12288
++    VirtualSize:     3000
++    SectionData:     '01000000'
++  - Name:            .reloc
++    Characteristics: [ IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_MEM_DISCARDABLE, IMAGE_SCN_MEM_READ ]
++    VirtualAddress:  16384
++    VirtualSize:     32
++    SectionData:     '4DB3FFFF3090F9FF606DA6FFC69393FF'
++symbols:         []
++...
+diff --git a/llvm/test/Object/coff-data-dir-out-of-bounds.test b/llvm/test/Object/coff-data-dir-out-of-bounds.test
+new file mode 100644
+index 000000000000..6ad151db44e7
+--- /dev/null
++++ b/llvm/test/Object/coff-data-dir-out-of-bounds.test
+@@ -0,0 +1,10 @@
++; Check an executable, where the baes relocation data directory points into
++; a section (within the range specified by VirtualSize), but outside of the
++; raw data provided in the executable. Make sure that we don't error out on
++; the executable - but we don't try to print any base relocs (as their data
++; is missing).
++
++RUN: yaml2obj %p/Inputs/COFF/data-dir-out-of-bounds.yaml | llvm-readobj --coff-basereloc - | FileCheck %s
++
++CHECK:      BaseReloc [
++CHECK-NEXT: ]
+-- 
+2.36.1
+
