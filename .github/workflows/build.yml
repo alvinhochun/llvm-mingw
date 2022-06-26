@@ -224,7 +224,7 @@ jobs:
           name: windows-x86_64-toolchain
       - name: Unpack toolchain
         run: |
-          7z x llvm-mingw-x86_64.7z
+          "C:/Program Files/7-Zip/7z.exe" x llvm-mingw-x86_64.7z
           rm llvm-mingw-x86_64.7z
           mv llvm-mingw-* /llvm-mingw
           echo /llvm-mingw/bin >> $GITHUB_PATH
