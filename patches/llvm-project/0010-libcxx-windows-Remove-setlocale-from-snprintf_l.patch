@@ -1,0 +1,39 @@
+From ef8aba1a3b577b6937b323a85168faa3e952e9e1 Mon Sep 17 00:00:00 2001
+From: Alvin Wong <alvin@alvinhc.com>
+Date: Sun, 26 Jun 2022 01:59:00 +0800
+Subject: [PATCH] [libcxx][windows] Remove setlocale from snprintf_l
+
+This speeds up number-to-string conversion using ostringstream by a
+factor of 5x to 100x.
+---
+ libcxx/src/support/win32/locale_win32.cpp | 14 +++++++++-----
+ 1 file changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/libcxx/src/support/win32/locale_win32.cpp b/libcxx/src/support/win32/locale_win32.cpp
+index 43e5c9a57227..d34d6803f74b 100644
+--- a/libcxx/src/support/win32/locale_win32.cpp
++++ b/libcxx/src/support/win32/locale_win32.cpp
+@@ -96,11 +96,15 @@ int snprintf_l(char *ret, size_t n, locale_t loc, const char *format, ...)
+         _CRT_INTERNAL_LOCAL_PRINTF_OPTIONS | _CRT_INTERNAL_PRINTF_STANDARD_SNPRINTF_BEHAVIOR,
+         ret, n, format, loc, ap);
+ #else
+-    __libcpp_locale_guard __current(loc);
+-#pragma clang diagnostic push
+-#pragma clang diagnostic ignored "-Wformat-nonliteral"
+-    int result = vsnprintf( ret, n, format, ap );
+-#pragma clang diagnostic pop
++    int result;
++    if (n != 0) {
++      va_list ap_copy;
++      va_copy(ap_copy, ap);
++      result = _vsnprintf_s_l(ret, n, _TRUNCATE, format, loc, ap_copy);
++      va_end(ap_copy);
++    }
++    if (n == 0 || result < 0)
++      result = _vscprintf_l(format, loc, ap);
+ #endif
+     va_end(ap);
+     return result;
+-- 
+2.36.1
+
