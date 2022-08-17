@@ -85,6 +85,11 @@ for arch in $ARCHS; do
         -DCMAKE_RANLIB="$PREFIX/bin/llvm-ranlib" \
         -DLIBOMP_ENABLE_SHARED=TRUE \
         $CMAKEFLAGS \
+        -DCMAKE_C_FLAGS_INIT="-Xclang -cfguard" \
+        -DCMAKE_CXX_FLAGS_INIT="-Xclang -cfguard" \
+        -DCMAKE_EXE_LINKER_FLAGS_INIT="-Wl,-Xlink,-guard:cf" \
+        -DCMAKE_SHARED_LINKER_FLAGS_INIT="-Wl,-Xlink,-guard:cf" \
+        -DCMAKE_MODULE_LINKER_FLAGS_INIT="-Wl,-Xlink,-guard:cf" \
         ..
     $BUILDCMD ${CORES+-j$CORES}
     $BUILDCMD install

@@ -107,6 +107,11 @@ for arch in $ARCHS; do
         -DLIBCXXABI_USE_LLVM_UNWINDER=ON \
         -DLIBCXXABI_ENABLE_SHARED=OFF \
         -DLIBCXXABI_LIBDIR_SUFFIX="" \
+        -DCMAKE_C_FLAGS_INIT="-Xclang -cfguard" \
+        -DCMAKE_CXX_FLAGS_INIT="-Xclang -cfguard" \
+        -DCMAKE_EXE_LINKER_FLAGS_INIT="-Wl,-Xlink,-guard:cf" \
+        -DCMAKE_SHARED_LINKER_FLAGS_INIT="-Wl,-Xlink,-guard:cf" \
+        -DCMAKE_MODULE_LINKER_FLAGS_INIT="-Wl,-Xlink,-guard:cf" \
         ..
 
     $BUILDCMD ${CORES+-j$CORES}
