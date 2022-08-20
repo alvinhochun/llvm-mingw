@@ -80,6 +80,7 @@ TESTS_UBSAN="ubsan"
 TESTS_OMP="hello-omp"
 TESTS_UWP="uwp-error"
 TESTS_IDL="idltest"
+TESTS_CFGUARD="cfguard-test"
 TESTS_OTHER_TARGETS="hello"
 for arch in $ARCHS; do
     case $arch in
@@ -160,6 +161,9 @@ for arch in $ARCHS; do
     done
     for test in $TESTS_SSP; do
         $arch-w64-mingw32-clang $test.c -o $TEST_DIR/$test.exe -fstack-protector-strong
+    done
+    for test in $TESTS_CFGUARD; do
+        $arch-w64-mingw32-clang $test.c -o $TEST_DIR/$test.exe -Xclang -cfguard -Wl,-Xlink,-guard:cf
     done
     for test in $TESTS_IDL; do
         # This is primary a build-only test, so no need to execute it.
@@ -251,6 +255,20 @@ for arch in $ARCHS; do
         file=$test.exe
         if [ -n "$RUN" ]; then
             $RUN $file
+        fi
+    done
+    for test in $TESTS_CFGUARD; do
+        # Check that the executable has been compiled with CFG enabled.
+        llvm-readobj --file-headers $test.exe | grep -q 'IMAGE_DLL_CHARACTERISTICS_GUARD_CF (0x4000)'
+        llvm-readobj --coff-load-config $test.exe | grep -q 'GuardFlags: 0x500'
+        if [ -n "$RUN" ]; then
+            if $RUN $test.exe check_enabled; then
+                $RUN $test.exe normal_icall
+                # We want to check the exit code to be 0xc0000409. MSYS2 bash
+                # does not give us the full 8-bit exit code, so we have to rely
+                # on cmd.exe to perform the check.
+                cmd //c "$test.exe invalid_icall & if errorlevel -1073740791 (if not errorlevel -1073740790 (exit 0)) & exit 1"
+            fi
         fi
     done
     cd ..
