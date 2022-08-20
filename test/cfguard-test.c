@@ -35,6 +35,16 @@ void make_indirect_call(void (*fn_ptr)(void)) {
     fn_ptr();
 }
 
+// FIXME: Remove when Clang gains support for __attribute((guard(nocf)))
+#pragma push_macro("__declspec")
+#undef __declspec
+__attribute__ (( noinline ))
+__declspec(guard(nocf))
+void make_indirect_call_nocf(void (*fn_ptr)(void)) {
+    fn_ptr();
+}
+#pragma pop_macro("__declspec")
+
 int check_cfguard_status(void) {
     PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY policy;
     BOOL result = GetProcessMitigationPolicy(GetCurrentProcess(),
@@ -74,7 +84,17 @@ int main(int argc, char *argv[]) {
             puts("Unexpectedly returned from indirect call!");
             return 1;
         }
+        if (strcmp(argv[1], "invalid_icall_nocf") == 0) {
+            void *target = nop_sled_target;
+            target += 16;
+            puts("Performing invalid indirect call without CFG. You should "
+                 "get an exit code 2...");
+            fflush(stdout);
+            make_indirect_call_nocf(target);
+            puts("Unexpectedly returned from indirect call!");
+            return 1;
+        }
     }
-    printf("%s ( check_enabled | normal_icall | invalid_icall )\n", argv[0]);
+    printf("%s ( check_enabled | normal_icall | invalid_icall | invalid_icall_nocf )\n", argv[0]);
     return 32;
 }

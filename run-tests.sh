@@ -163,7 +163,8 @@ for arch in $ARCHS; do
         $arch-w64-mingw32-clang $test.c -o $TEST_DIR/$test.exe -fstack-protector-strong
     done
     for test in $TESTS_CFGUARD; do
-        $arch-w64-mingw32-clang $test.c -o $TEST_DIR/$test.exe -Xclang -cfguard -Wl,-Xlink,-guard:cf
+        # FIXME: Remove -fdeclspec when Clang supports __attribute__((guard(nocf)))
+        $arch-w64-mingw32-clang $test.c -o $TEST_DIR/$test.exe -fdeclspec -Xclang -cfguard -Wl,-Xlink,-guard:cf
     done
     for test in $TESTS_IDL; do
         # This is primary a build-only test, so no need to execute it.
@@ -264,6 +265,7 @@ for arch in $ARCHS; do
         if [ -n "$RUN" ]; then
             if $RUN $test.exe check_enabled; then
                 $RUN $test.exe normal_icall
+                $RUN $test.exe invalid_icall_nocf || [ $? = 2 ]
                 # We want to check the exit code to be 0xc0000409. MSYS2 bash
                 # does not give us the full 8-bit exit code, so we have to rely
                 # on cmd.exe to perform the check.
