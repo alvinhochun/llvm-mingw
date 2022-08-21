@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 #
 # Copyright (c) 2018 Martin Storsjo
 #
@@ -24,14 +24,16 @@ while [ $# -gt 0 ]; do
         SRC_DIR=..
         BUILD_SUFFIX=-sanitizers
         SANITIZERS=1
-        EXTRA_CMAKE_FLAGS=-DCOMPILER_RT_BUILD_BUILTINS=FALSE
+        EXTRA_CMAKE_FLAGS=("-DCOMPILER_RT_BUILD_BUILTINS=FALSE")
     else
         PREFIX="$1"
-        EXTRA_CMAKE_FLAGS="-DCMAKE_C_FLAGS_INIT='-Xclang -cfguard'"
-        EXTRA_CMAKE_FLAGS="$EXTRA_CMAKE_FLAGS -DCMAKE_CXX_FLAGS_INIT='-Xclang -cfguard'"
-        EXTRA_CMAKE_FLAGS="$EXTRA_CMAKE_FLAGS -DCMAKE_EXE_LINKER_FLAGS_INIT=-Wl,-Xlink,-guard:cf"
-        EXTRA_CMAKE_FLAGS="$EXTRA_CMAKE_FLAGS -DCMAKE_SHARED_LINKER_FLAGS_INIT=-Wl,-Xlink,-guard:cf"
-        EXTRA_CMAKE_FLAGS="$EXTRA_CMAKE_FLAGS -DCMAKE_MODULE_LINKER_FLAGS_INIT=-Wl,-Xlink,-guard:cf"
+        EXTRA_CMAKE_FLAGS=(
+            -DCMAKE_C_FLAGS_INIT="-Xclang -cfguard"
+            -DCMAKE_CXX_FLAGS_INIT="-Xclang -cfguard"
+            "-DCMAKE_EXE_LINKER_FLAGS_INIT=-Wl,-Xlink,-guard:cf"
+            "-DCMAKE_SHARED_LINKER_FLAGS_INIT=-Wl,-Xlink,-guard:cf"
+            "-DCMAKE_MODULE_LINKER_FLAGS_INIT=-Wl,-Xlink,-guard:cf"
+        )
     fi
     shift
 done
@@ -103,7 +105,7 @@ for arch in $ARCHS; do
         -DCOMPILER_RT_USE_BUILTINS_LIBRARY=TRUE \
         -DLLVM_CONFIG_PATH="" \
         -DSANITIZER_CXX_ABI=libc++ \
-        $EXTRA_CMAKE_FLAGS \
+        "${EXTRA_CMAKE_FLAGS[@]}" \
         $SRC_DIR
     $BUILDCMD ${CORES+-j$CORES}
     $BUILDCMD install
