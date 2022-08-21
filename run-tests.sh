@@ -205,6 +205,7 @@ for arch in $ARCHS; do
         *) continue ;;
         esac
         $arch-w64-mingw32-clang $test.c -o $TEST_DIR/$test-asan.exe -fsanitize=address -g -gcodeview -Wl,-pdb,$TEST_DIR/$test-asan.pdb
+        $arch-w64-mingw32-clang $test.c -o $TEST_DIR/$test-asan-cfguard.exe -fsanitize=address -g -gcodeview -Wl,-pdb,$TEST_DIR/$test-asan-cfguard.pdb -Xclang -cfguard -Wl,-Xlink,-guard:cf
         # Only run these tests on native windows; asan doesn't run in wine.
         if [ -n "$NATIVE" ]; then
             TESTS_EXTRA="$TESTS_EXTRA $test"
@@ -273,6 +274,14 @@ for arch in $ARCHS; do
             fi
         fi
     done
+    if [ -n "$NATIVE" ]; then
+        for test in $TESTS_ASAN; do
+            if [ -n "$RUN" ]; then
+                $RUN $test-asan-cfguard.exe
+                $RUN $test-asan-cfguard.exe crash || echo $?
+            fi
+        done
+    fi
     cd ..
 done
 echo All tests succeeded
