@@ -17,6 +17,13 @@ void nop_sled_target(void) {
     __asm__("nop"); __asm__("nop"); __asm__("nop"); __asm__("nop");
     __asm__("nop"); __asm__("nop"); __asm__("nop"); __asm__("nop");
 
+#if defined(__x86_64__)
+    // On x86_64 the stack frame has to be aligned to 16 bytes. Since we
+    // skipped the prologue we need to manually realign it to prevent
+    // alignment-related crashes when calling puts() or exit().
+    __asm__("and $~0xF, %rsp");
+#endif
+
     puts("Pwned!!!");
 
     // We skipped the function prologue with the indirect call. If we let
