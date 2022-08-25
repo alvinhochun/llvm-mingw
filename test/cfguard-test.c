@@ -42,15 +42,10 @@ void make_indirect_call(void (*fn_ptr)(void)) {
     fn_ptr();
 }
 
-// FIXME: Remove when Clang gains support for __attribute((guard(nocf)))
-#pragma push_macro("__declspec")
-#undef __declspec
-__attribute__ (( noinline ))
-__declspec(guard(nocf))
+__attribute__ (( noinline, guard(nocf) ))
 void make_indirect_call_nocf(void (*fn_ptr)(void)) {
     fn_ptr();
 }
-#pragma pop_macro("__declspec")
 
 int check_cfguard_status(void) {
     PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY policy;
