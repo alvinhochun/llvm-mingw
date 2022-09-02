@@ -89,7 +89,7 @@ if [ ! -d llvm-project ]; then
     mkdir llvm-project
     cd llvm-project
     git init
-    git remote add origin https://github.com/llvm/llvm-project.git
+    git remote add origin https://github.com/alvinhochun/llvm-project.git
     cd ..
     CHECKOUT=1
 fi
