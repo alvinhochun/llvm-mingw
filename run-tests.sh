@@ -163,7 +163,7 @@ for arch in $ARCHS; do
         $arch-w64-mingw32-clang $test.c -o $TEST_DIR/$test.exe -fstack-protector-strong
     done
     for test in $TESTS_CFGUARD; do
-        $arch-w64-mingw32-clang $test.c -o $TEST_DIR/$test.exe -Xclang -cfguard -Wl,-Xlink,-guard:cf
+        $arch-w64-mingw32-clang $test.c -o $TEST_DIR/$test.exe -mguard=cf
     done
     for test in $TESTS_IDL; do
         # This is primary a build-only test, so no need to execute it.
@@ -204,7 +204,7 @@ for arch in $ARCHS; do
         *) continue ;;
         esac
         $arch-w64-mingw32-clang $test.c -o $TEST_DIR/$test-asan.exe -fsanitize=address -g -gcodeview -Wl,-pdb,$TEST_DIR/$test-asan.pdb
-        $arch-w64-mingw32-clang $test.c -o $TEST_DIR/$test-asan-cfguard.exe -fsanitize=address -g -gcodeview -Wl,-pdb,$TEST_DIR/$test-asan-cfguard.pdb -Xclang -cfguard -Wl,-Xlink,-guard:cf
+        $arch-w64-mingw32-clang $test.c -o $TEST_DIR/$test-asan-cfguard.exe -fsanitize=address -g -gcodeview -Wl,-pdb,$TEST_DIR/$test-asan-cfguard.pdb -mguard=cf
         # Only run these tests on native windows; asan doesn't run in wine.
         if [ -n "$NATIVE" ]; then
             TESTS_EXTRA="$TESTS_EXTRA $test"

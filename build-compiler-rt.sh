@@ -28,11 +28,8 @@ while [ $# -gt 0 ]; do
     else
         PREFIX="$1"
         EXTRA_CMAKE_FLAGS=(
-            -DCMAKE_C_FLAGS_INIT="-Xclang -cfguard"
-            -DCMAKE_CXX_FLAGS_INIT="-Xclang -cfguard"
-            "-DCMAKE_EXE_LINKER_FLAGS_INIT=-Wl,-Xlink,-guard:cf"
-            "-DCMAKE_SHARED_LINKER_FLAGS_INIT=-Wl,-Xlink,-guard:cf"
-            "-DCMAKE_MODULE_LINKER_FLAGS_INIT=-Wl,-Xlink,-guard:cf"
+            -DCMAKE_C_FLAGS_INIT="-mguard=cf"
+            -DCMAKE_CXX_FLAGS_INIT="-mguard=cf"
         )
     fi
     shift

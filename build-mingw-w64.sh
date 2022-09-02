@@ -87,9 +87,8 @@ mkdir -p build
 cd build
 ../configure --prefix="$HEADER_ROOT" \
     --enable-idl --with-default-win32-winnt=$DEFAULT_WIN32_WINNT --with-default-msvcrt=$DEFAULT_MSVCRT INSTALL="install -C" \
-    CFLAGS="-Xclang -cfguard -g -O2" \
-    CXXFLAGS="-Xclang -cfguard -g -O2" \
-    LDFLAGS="-Wl,-Xlink,-guard:cf"
+    CFLAGS="-mguard=cf -g -O2" \
+    CXXFLAGS="-mguard=cf -g -O2"
 $MAKE install
 cd ../..
 if [ -z "$SKIP_INCLUDE_TRIPLET_PREFIX" ]; then
@@ -121,10 +120,7 @@ for arch in $ARCHS; do
         ;;
     esac
     FLAGS="$FLAGS --with-default-msvcrt=$DEFAULT_MSVCRT"
-    ../configure --host=$arch-w64-mingw32 --prefix="$PREFIX/$arch-w64-mingw32" $FLAGS \
-        CFLAGS="-Xclang -cfguard -g -O2" \
-        CXXFLAGS="-Xclang -cfguard -g -O2" \
-        LDFLAGS="-Wl,-Xlink,-guard:cf"
+    ../configure --host=$arch-w64-mingw32 --prefix="$PREFIX/$arch-w64-mingw32" --enable-cfguard $FLAGS
     $MAKE -j$CORES
     $MAKE install
     cd ..

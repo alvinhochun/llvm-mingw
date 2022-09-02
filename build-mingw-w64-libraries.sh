@@ -44,9 +44,8 @@ for lib in winpthreads winstorecompat; do
         cd build-$arch
         arch_prefix="$PREFIX/$arch-w64-mingw32"
         ../configure --host=$arch-w64-mingw32 --prefix="$arch_prefix" --libdir="$arch_prefix/lib" \
-            CFLAGS="-Xclang -cfguard -g -O2" \
-            CXXFLAGS="-Xclang -cfguard -g -O2" \
-            LDFLAGS="-Wl,-Xlink,-guard:cf"
+            CFLAGS="-mguard=cf -g -O2" \
+            CXXFLAGS="-mguard=cf -g -O2"
         make -j$CORES
         make install
         cd ..

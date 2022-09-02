@@ -4,8 +4,7 @@ vpath %.c $(SRC_PATH)
 CC = $(CROSS)gcc
 AR = $(CROSS)ar
 
-CFLAGS = -Xclang -cfguard -O2 -Wall -Wundef -I$(SRC_PATH) -D_FORTIFY_SOURCE=0 -D__SSP_FORTIFY_LEVEL=0
-LDFLAGS = -Wl,-Xlink,-guard:cf
+CFLAGS = -mguard=cf -O2 -Wall -Wundef -I$(SRC_PATH) -D_FORTIFY_SOURCE=0 -D__SSP_FORTIFY_LEVEL=0
 
 SOURCES = $(filter-out ssp-local.c, $(patsubst $(SRC_PATH)%,%,$(wildcard $(SRC_PATH)*.c)))
 OBJS = $(SOURCES:%.c=%.o)
