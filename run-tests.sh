@@ -261,7 +261,8 @@ for arch in $ARCHS; do
     for test in $TESTS_CFGUARD; do
         # Check that the executable has been compiled with CFG enabled.
         llvm-readobj --file-headers $test.exe | grep -q 'IMAGE_DLL_CHARACTERISTICS_GUARD_CF (0x4000)'
-        llvm-readobj --coff-load-config $test.exe | grep -q 'GuardFlags: 0x500'
+        llvm-readobj --coff-load-config $test.exe | grep -q 'CF_FUNCTION_TABLE_PRESENT (0x400)'
+        llvm-readobj --coff-load-config $test.exe | grep -q 'CF_INSTRUMENTED (0x100)'
         if [ -n "$RUN" ]; then
             if $RUN $test.exe check_enabled; then
                 $RUN $test.exe normal_icall
