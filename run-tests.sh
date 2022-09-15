@@ -197,6 +197,7 @@ for arch in $ARCHS; do
             esac
         done
     done
+    TEST_ASAN_CFGUARD=
     for test in $TESTS_ASAN; do
         case $arch in
         # Sanitizers on windows only support x86.
@@ -208,6 +209,7 @@ for arch in $ARCHS; do
         # Only run these tests on native windows; asan doesn't run in wine.
         if [ -n "$NATIVE" ]; then
             TESTS_EXTRA="$TESTS_EXTRA $test"
+            TEST_ASAN_CFGUARD="$TEST_ASAN_CFGUARD $test"
         fi
     done
     for test in $TESTS_UBSAN; do
@@ -267,21 +269,22 @@ for arch in $ARCHS; do
             if $RUN $test.exe check_enabled; then
                 $RUN $test.exe normal_icall
                 $RUN $test.exe invalid_icall_nocf || [ $? = 2 ]
-                # We want to check the exit code to be 0xc0000409. MSYS2 bash
-                # does not give us the full 8-bit exit code, so we have to rely
-                # on cmd.exe to perform the check.
+                # We want to check the exit code to be 0xc0000409
+                # (STATUS_STACK_BUFFER_OVERRUN aka fail fast exception). MSYS2
+                # bash does not give us the full 32-bit exit code, so we have
+                # to rely on cmd.exe to perform the check.
+                # (This doesn't work on WINE, but WINE doesn't support CFG
+                # anyway, at least not for now...)
                 cmd //c "$test.exe invalid_icall & if errorlevel -1073740791 (if not errorlevel -1073740790 (exit 0)) & exit 1"
             fi
         fi
     done
-    if [ -n "$NATIVE" ]; then
-        for test in $TESTS_ASAN; do
-            if [ -n "$RUN" ]; then
-                $RUN $test-asan-cfguard.exe
-                $RUN $test-asan-cfguard.exe crash || echo $?
-            fi
-        done
-    fi
+    for test in $TEST_ASAN_CFGUARD; do
+        if [ -n "$RUN" ]; then
+            $RUN $test-asan-cfguard.exe
+            $RUN $test-asan-cfguard.exe crash || echo $?
+        fi
+    done
     cd ..
 done
 echo All tests succeeded
