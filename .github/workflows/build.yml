@@ -72,83 +72,85 @@ jobs:
           retention-days: 7
 
   # Build a cross compiler for macOS, targeting Windows.
-  # macos:
-  #   if: (github.event_name != 'schedule') || (github.repository == 'mstorsjo/llvm-mingw')
-  #   needs: [get-versions]
-  #   runs-on: macos-latest
-  #   steps:
-  #     - uses: actions/download-artifact@v3
-  #       if: github.event_name == 'schedule'
-  #       with:
-  #         name: versions
-  #     - name: Set build env vars
-  #       if: github.event_name == 'schedule'
-  #       run: |
-  #         . versions
-  #         echo Building llvm-project $LLVM_VERSION mingw-w64 $MINGW_W64_VERSION
-  #         cat versions >> $GITHUB_ENV
-  #     - uses: actions/checkout@v2
-  #     - name: Build
-  #       run: |
-  #         brew install ninja
-  #         # Building with MACOS_REDIST=1 (building universal binaries) without
-  #         # --disable-lldb fails in Github Actions, because python is available
-  #         # (and gets picked up), but only exists in native form.
-  #         # Disable use of zstd too - it's also available, but only in native
-  #         # form.
-  #         MACOS_REDIST=1 LLVM_CMAKEFLAGS="-DLLVM_ENABLE_ZSTD=OFF" ./build-all.sh $(pwd)/install/llvm-mingw --disable-clang-tools-extra --disable-lldb
-  #         cd install
-  #         tar -Jcf ../llvm-mingw-macos.tar.xz llvm-mingw
-  #     - uses: actions/upload-artifact@v2
-  #       with:
-  #         name: macos-toolchain
-  #         path: |
-  #           llvm-mingw-macos.tar.xz
-  #         retention-days: 7
+  macos:
+    # if: (github.event_name != 'schedule') || (github.repository == 'mstorsjo/llvm-mingw')
+    if: false
+    needs: [get-versions]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/download-artifact@v3
+        if: github.event_name == 'schedule'
+        with:
+          name: versions
+      - name: Set build env vars
+        if: github.event_name == 'schedule'
+        run: |
+          . versions
+          echo Building llvm-project $LLVM_VERSION mingw-w64 $MINGW_W64_VERSION
+          cat versions >> $GITHUB_ENV
+      - uses: actions/checkout@v2
+      - name: Build
+        run: |
+          brew install ninja
+          # Building with MACOS_REDIST=1 (building universal binaries) without
+          # --disable-lldb fails in Github Actions, because python is available
+          # (and gets picked up), but only exists in native form.
+          # Disable use of zstd too - it's also available, but only in native
+          # form.
+          MACOS_REDIST=1 LLVM_CMAKEFLAGS="-DLLVM_ENABLE_ZSTD=OFF" ./build-all.sh $(pwd)/install/llvm-mingw --disable-clang-tools-extra --disable-lldb
+          cd install
+          tar -Jcf ../llvm-mingw-macos.tar.xz llvm-mingw
+      - uses: actions/upload-artifact@v2
+        with:
+          name: macos-toolchain
+          path: |
+            llvm-mingw-macos.tar.xz
+          retention-days: 7
 
-  # # Test building the toolchain on msys2 (in the mingw64 and clang64
-  # # environments). The binaries built here rely on the runtime libraries from
-  # # the host environment (libstdc++ or libc++). No artifacts are stored from
-  # # these builds, but llvm-mingw's tests are run.
-  # msys2:
-  #   if: (github.event_name != 'schedule') || (github.repository == 'mstorsjo/llvm-mingw')
-  #   needs: [get-versions]
-  #   runs-on: windows-latest
-  #   defaults:
-  #     run:
-  #       shell: msys2 {0}
-  #   strategy:
-  #     fail-fast: false
-  #     matrix:
-  #       sys:
-  #         - mingw64
-  #         - clang64
-  #   steps:
-  #     - uses: msys2/setup-msys2@v2
-  #       with:
-  #         msystem: ${{matrix.sys}}
-  #         install: >-
-  #           git
-  #           make
-  #         pacboy: >-
-  #           toolchain:p
-  #           cmake:p
-  #           ninja:p
-  #     - uses: actions/download-artifact@v3
-  #       if: github.event_name == 'schedule'
-  #       with:
-  #         name: versions
-  #     - name: Set build env vars
-  #       if: github.event_name == 'schedule'
-  #       run: |
-  #         . versions
-  #         echo Building llvm-project $LLVM_VERSION mingw-w64 $MINGW_W64_VERSION
-  #         cat versions >> $GITHUB_ENV
-  #     - uses: actions/checkout@v2
-  #     - name: Build
-  #       run: |
-  #         ./build-all.sh $(pwd)/install/llvm-mingw --disable-clang-tools-extra --disable-lldb
-  #         ./run-tests.sh $(pwd)/install/llvm-mingw
+  # Test building the toolchain on msys2 (in the mingw64 and clang64
+  # environments). The binaries built here rely on the runtime libraries from
+  # the host environment (libstdc++ or libc++). No artifacts are stored from
+  # these builds, but llvm-mingw's tests are run.
+  msys2:
+    # if: (github.event_name != 'schedule') || (github.repository == 'mstorsjo/llvm-mingw')
+    if: false
+    needs: [get-versions]
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    strategy:
+      fail-fast: false
+      matrix:
+        sys:
+          - mingw64
+          - clang64
+    steps:
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{matrix.sys}}
+          install: >-
+            git
+            make
+          pacboy: >-
+            toolchain:p
+            cmake:p
+            ninja:p
+      - uses: actions/download-artifact@v3
+        if: github.event_name == 'schedule'
+        with:
+          name: versions
+      - name: Set build env vars
+        if: github.event_name == 'schedule'
+        run: |
+          . versions
+          echo Building llvm-project $LLVM_VERSION mingw-w64 $MINGW_W64_VERSION
+          cat versions >> $GITHUB_ENV
+      - uses: actions/checkout@v2
+      - name: Build
+        run: |
+          ./build-all.sh $(pwd)/install/llvm-mingw --disable-clang-tools-extra --disable-lldb
+          ./run-tests.sh $(pwd)/install/llvm-mingw
 
   # Use the Linux cross compilers built in the first step to cross compile
   # llvm and make a proper standalone toolchain for Windows (for all 4
