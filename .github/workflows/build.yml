@@ -13,14 +13,14 @@ jobs:
   # slightly more, when we know a separate build of the same version but with
   # assertions enabled, has passed some amount of tests.
   get-versions:
-    if: (github.event_name != 'schedule') || (github.repository == 'mstorsjo/llvm-mingw')
+    if: true || (github.event_name != 'schedule') || (github.repository == 'mstorsjo/llvm-mingw')
     runs-on: ubuntu-latest
     steps:
       - name: Touch file
         run: |
           touch versions
       - name: Check latest version
-        if: github.event_name == 'schedule'
+        if: true || github.event_name == 'schedule'
         run: |
           echo LLVM_VERSION=$(git ls-remote https://github.com/llvm/llvm-project.git | grep 'refs/heads/main$' | awk '{print $1}') >> versions
           echo MINGW_W64_VERSION=$(git ls-remote https://github.com/mingw-w64/mingw-w64.git | grep 'refs/heads/master$' | awk '{print $1}') >> versions
@@ -40,11 +40,11 @@ jobs:
     steps:
       - uses: actions/checkout@v2
       - uses: actions/download-artifact@v3
-        if: github.event_name == 'schedule'
+        if: true || github.event_name == 'schedule'
         with:
           name: versions
       - name: Set build env vars
-        if: github.event_name == 'schedule'
+        if: true || github.event_name == 'schedule'
         run: |
           . versions
           echo Building llvm-project $LLVM_VERSION mingw-w64 $MINGW_W64_VERSION
@@ -80,11 +80,11 @@ jobs:
     steps:
       - uses: actions/checkout@v2
       - uses: actions/download-artifact@v3
-        if: github.event_name == 'schedule'
+        if: true || github.event_name == 'schedule'
         with:
           name: versions
       - name: Set build env vars
-        if: github.event_name == 'schedule'
+        if: true || github.event_name == 'schedule'
         run: |
           . versions
           echo Building llvm-project $LLVM_VERSION mingw-w64 $MINGW_W64_VERSION, with assertions enabled
@@ -113,11 +113,11 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/download-artifact@v3
-        if: github.event_name == 'schedule'
+        if: true || github.event_name == 'schedule'
         with:
           name: versions
       - name: Set build env vars
-        if: github.event_name == 'schedule'
+        if: true || github.event_name == 'schedule'
         run: |
           . versions
           echo Building llvm-project $LLVM_VERSION mingw-w64 $MINGW_W64_VERSION
@@ -178,11 +178,11 @@ jobs:
             cmake:p
             ninja:p
       - uses: actions/download-artifact@v3
-        if: github.event_name == 'schedule'
+        if: true || github.event_name == 'schedule'
         with:
           name: versions
       - name: Set build env vars
-        if: github.event_name == 'schedule'
+        if: true || github.event_name == 'schedule'
         run: |
           . versions
           echo Building llvm-project $LLVM_VERSION mingw-w64 $MINGW_W64_VERSION
@@ -221,7 +221,7 @@ jobs:
           sudo mv llvm-mingw /opt/llvm-mingw
           echo /opt/llvm-mingw/bin >> $GITHUB_PATH
       - name: Fetch version
-        if: github.event_name == 'schedule'
+        if: true ||　github.event_name == 'schedule'
         run: |
           . /opt/llvm-mingw/versions
           echo Building llvm-project $LLVM_VERSION mingw-w64 $MINGW_W64_VERSION cpython-mingw $PYTHON_VERSION_MINGW
