@@ -117,6 +117,7 @@ if [ -n "$SYNC" ] || [ -n "$CHECKOUT" ]; then
             ;;
         esac
     fi
+    curl -L 'https://reviews.llvm.org/D144049?download=true' | git apply
     cd ..
 fi
 
